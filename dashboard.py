@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 
@@ -32,6 +33,16 @@ RISK_PROFILES = {
     "中立 ⚖️": {"lev_mult": 0.70, "label": "中立", "color": "#a78bfa"},
     "激進 🔥": {"lev_mult": 1.00, "label": "激進", "color": "#f97316"},
 }
+
+
+def _safe_read_csv(path, **kwargs) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.ParserError:
+        fallback = dict(kwargs)
+        fallback.setdefault("engine", "python")
+        fallback.setdefault("on_bad_lines", "skip")
+        return pd.read_csv(path, **fallback)
 
 
 def _safe_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -104,6 +115,18 @@ def _should_run_quick_update_now(df: pd.DataFrame, interval: str) -> bool:
     return now_utc >= due_time
 
 
+def _direction_confidence(p_long: float, p_short: float, p_flat: float) -> float:
+    """Directional confidence in [0, 1], avoids being stuck at 0 when p_flat is high."""
+    try:
+        pl = float(p_long)
+        ps = float(p_short)
+        pf = float(p_flat)
+    except Exception:
+        return 0.0
+    vals = [0.0 if pd.isna(v) else max(0.0, min(1.0, v)) for v in (pl, ps, pf)]
+    return max(vals[0], vals[1])
+
+
 def _ai_classify_style(row: pd.Series) -> tuple[str, str, float]:
     """
     AI 自動判斷市場風格。
@@ -119,7 +142,7 @@ def _ai_classify_style(row: pd.Series) -> tuple[str, str, float]:
     macd_hist = float(row.get("macd_hist", 0) or 0)
     drawdown = float(row.get("drawdown", 0) or 0)
 
-    confidence = max(p_long, p_short) - p_flat
+    confidence = _direction_confidence(p_long, p_short, p_flat)
 
     score = 0.0
 
@@ -344,6 +367,11 @@ st.markdown(
       .js-plotly-plot, .js-plotly-plot * {
         cursor: default !important;
       }
+
+      /* Guard against sporadic duplicated tab headers in Streamlit frontend */
+      [data-testid="stTabs"] [data-baseweb="tab-list"] + [data-baseweb="tab-list"] {
+        display: none !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -354,11 +382,11 @@ def 讀取訊號資料() -> pd.DataFrame:
     if not 目前訊號檔.exists():
         舊檔 = OUTPUT_DIR / "signals_with_features.csv"
         if 週期 == "1h" and 舊檔.exists():
-            df = pd.read_csv(舊檔)
+            df = _safe_read_csv(舊檔)
         else:
             return pd.DataFrame()
     else:
-        df = pd.read_csv(目前訊號檔)
+        df = _safe_read_csv(目前訊號檔)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     return df.sort_values("timestamp").reset_index(drop=True)
 
@@ -379,7 +407,7 @@ def 讀取交易明細(symbol: str, interval: str) -> pd.DataFrame:
         p = OUTPUT_DIR / "trades.csv"
     if not p.exists():
         return pd.DataFrame()
-    return pd.read_csv(p)
+    return _safe_read_csv(p)
 
 
 def 取得數值(row: pd.Series, key: str, default: float = 0.0) -> float:
@@ -489,6 +517,7 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
         plot_bgcolor="rgba(0,0,0,0)",
         legend=dict(orientation="h", y=1.02, x=0),
         uirevision="kline-static",
+        dragmode="pan",
         hovermode="x unified",
         hoverdistance=120,
         spikedistance=1000,
@@ -533,6 +562,7 @@ def 買賣橫條圖(p_long: float, p_short: float, p_flat: float) -> go.Figure:
         margin=dict(l=20, r=20, t=10, b=20),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="pan",
         xaxis_title="機率 (%)",
         xaxis=dict(gridcolor="#1e293b", range=[0, 105]),
     )
@@ -551,6 +581,7 @@ def 趨勢高低點圖(df: pd.DataFrame) -> go.Figure:
         template="plotly_dark", height=360,
         margin=dict(l=20, r=20, t=20, b=20),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="pan",
         uirevision="trend-static",
         xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
     )
@@ -570,6 +601,7 @@ def MACD圖(df: pd.DataFrame) -> go.Figure:
         template="plotly_dark", height=360,
         margin=dict(l=20, r=20, t=20, b=20),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="pan",
         uirevision="macd-static",
         xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
     )
@@ -578,14 +610,20 @@ def MACD圖(df: pd.DataFrame) -> go.Figure:
 
 def ATR圖(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["atr_14"], name="ATR(14)",
+    atr14 = pd.to_numeric(df.get("atr_14"), errors="coerce")
+    atr_pct = pd.to_numeric(df.get("atr_pct"), errors="coerce") * 100.0
+
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=atr14, name="ATR(14)",
                               line=dict(color="#a78bfa", width=2)))
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["atr_pct"] * 100, name="ATR%",
-                              line=dict(color="#f43f5e", width=2)))
+    # If ATR% is effectively all zeros, hide the flat zero line to reduce confusion.
+    if atr_pct.notna().any() and float(atr_pct.fillna(0).abs().max()) > 1e-9:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=atr_pct, name="ATR%",
+                                  line=dict(color="#f43f5e", width=2)))
     fig.update_layout(
         template="plotly_dark", height=360,
         margin=dict(l=20, r=20, t=20, b=20),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="pan",
         yaxis_title="ATR / ATR%", uirevision="atr-static",
         xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
     )
@@ -787,6 +825,7 @@ def 盈虧折線圖(trades: pd.DataFrame) -> go.Figure:
         template="plotly_dark", height=340,
         margin=dict(l=20, r=20, t=30, b=20),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="pan",
         yaxis_title=y_label, xaxis_title="出場時間",
         xaxis=dict(gridcolor="#1e293b"),
         yaxis=dict(gridcolor="#1e293b"),
@@ -834,7 +873,7 @@ def 格式化交易明細(trades: pd.DataFrame, signals: pd.DataFrame) -> pd.Dat
             df["看跌機率"] = df["進場時間"].apply(lambda t: f"{_match_num(t,'p_short')*100:.1f}%")
         if all(c in signals.columns for c in ["p_long", "p_short", "p_flat"]):
             df["信心指數"] = df["進場時間"].apply(
-                lambda t: f"{max(0.0, _match_num(t,'p_long') + _match_num(t,'p_short') - _match_num(t,'p_flat',0.34)) * 100:.1f}%"
+                lambda t: f"{_direction_confidence(_match_num(t,'p_long'), _match_num(t,'p_short'), _match_num(t,'p_flat',0.34)) * 100:.1f}%"
             )
         if "ai_style" in signals.columns:
             df["AI風格"] = df["進場時間"].apply(lambda t: _match_str(t, "ai_style", "中立"))
@@ -1370,7 +1409,7 @@ P看跌 = 取得數值(最新, "p_short")
 P觀望 = 取得數值(最新, "p_flat")
 模型槓桿 = 取得數值(最新, "suggested_leverage", 1.0)
 安全槓桿 = 取得數值(最新, "max_safe_leverage", 1.0)
-信心指數 = max(0.0, P看漲 + P看跌 - P觀望)
+信心指數 = _direction_confidence(P看漲, P看跌, P觀望)
 
 # ── AI 自動判斷風格 ─────────────────────────────────────────────────────────
 ai_style_label, ai_style_key, ai_style_score = _ai_classify_style(最新)
@@ -1638,7 +1677,20 @@ if 顯示SNR:
             bgcolor="rgba(15,23,42,0.65)",
         )
 
-st.plotly_chart(fig_k, use_container_width=True, config={"scrollZoom": True})
+st.plotly_chart(
+    fig_k,
+    use_container_width=True,
+    config={
+        "scrollZoom": True,
+        "displayModeBar": True,
+        "modeBarButtonsToAdd": ["pan2d", "zoom2d", "resetScale2d"],
+    },
+)
+_plotly_interact_config = {
+    "scrollZoom": True,
+    "displayModeBar": True,
+    "modeBarButtonsToAdd": ["pan2d", "zoom2d", "resetScale2d"],
+}
 
 # ── 分頁 ─────────────────────────────────────────────────────────────────────
 分頁 = st.tabs([
@@ -1651,19 +1703,19 @@ st.plotly_chart(fig_k, use_container_width=True, config={"scrollZoom": True})
     "📋 交易紀錄",
     "🏆 回測摘要",
     "🧑‍🏫 Teacher蒸餾",
-])
+], key="main_dashboard_tabs")
 
 with 分頁[0]:
-    st.plotly_chart(買賣橫條圖(P看漲, P看跌, P觀望), use_container_width=True)
+    st.plotly_chart(買賣橫條圖(P看漲, P看跌, P觀望), use_container_width=True, config=_plotly_interact_config)
 
 with 分頁[1]:
-    st.plotly_chart(趨勢高低點圖(顯示區), use_container_width=True)
+    st.plotly_chart(趨勢高低點圖(顯示區), use_container_width=True, config=_plotly_interact_config)
 
 with 分頁[2]:
-    st.plotly_chart(MACD圖(顯示區), use_container_width=True)
+    st.plotly_chart(MACD圖(顯示區), use_container_width=True, config=_plotly_interact_config)
 
 with 分頁[3]:
-    st.plotly_chart(ATR圖(顯示區), use_container_width=True)
+    st.plotly_chart(ATR圖(顯示區), use_container_width=True, config=_plotly_interact_config)
 
 with 分頁[4]:
     st.markdown("### 🗞️ 事件清單（左：過去 / 右：未來）")
@@ -1694,7 +1746,7 @@ with 分頁[4]:
             st.dataframe(未來事件表, use_container_width=True, hide_index=True)
 
 with 分頁[5]:
-    st.plotly_chart(恐懼貪婪儀表(取得數值(最新, "fear_greed_value", 50.0)), use_container_width=True)
+    st.plotly_chart(恐懼貪婪儀表(取得數值(最新, "fear_greed_value", 50.0)), use_container_width=True, config=_plotly_interact_config)
 
 # ─── 交易紀錄分頁（新） ────────────────────────────────────────────────────────
 with 分頁[6]:
@@ -1703,9 +1755,21 @@ with 分頁[6]:
     if trades_df.empty:
         st.info("尚未產生交易明細。請先執行一次「增量更新+重訓回測」或「快速更新」。")
     else:
-        # 累計盈虧折線圖
-        st.plotly_chart(盈虧折線圖(trades_df), use_container_width=True,
-                         config={"scrollZoom": True})
+        # 累計盈虧折線圖（僅顯示台北時區「今日 00:00」之後）
+        _chart_df = trades_df.copy()
+        _x_col = "出場時間" if "出場時間" in _chart_df.columns else _chart_df.columns[0]
+        _x_ts = pd.to_datetime(_chart_df[_x_col], utc=True, errors="coerce")
+        _today_tw = pd.Timestamp.now(tz="Asia/Taipei").normalize()
+        _today_utc = _today_tw.tz_convert("UTC")
+        _chart_df = _chart_df[_x_ts >= _today_utc].copy()
+        if _chart_df.empty:
+            st.info(f"今日（{_today_tw.strftime('%Y-%m-%d')}）尚無可顯示的交易圖表資料。")
+        else:
+            st.plotly_chart(
+                盈虧折線圖(_chart_df),
+                use_container_width=True,
+                config=_plotly_interact_config,
+            )
 
         st.divider()
         st.markdown("#### 逐筆交易明細")
@@ -1840,25 +1904,6 @@ with 分頁[7]:
             _sum_safe[_c] = _sum_safe[_c].astype(str)
         st.dataframe(_sum_safe, use_container_width=True, hide_index=True)
 
-# ── 自動刷新循環 ─────────────────────────────────────────────────────────────
-if 即時更新啟用 or 自動交易啟用:
-    refresh_s = int(min(
-        int(即時更新秒數) if 即時更新啟用 else 3600,
-        int(自動交易秒數) if 自動交易啟用 else 3600
-    ))
-    st.sidebar.caption(f"⏱ 自動循環中，每 {refresh_s} 秒刷新一次。")
-    time.sleep(max(1, refresh_s))
-    if _should_run_quick_update_now(signals, 週期):
-        try:
-            os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
-            run_quick_update(symbol=交易對, interval=週期)
-            st.session_state["kline_auto_last_msg"] = f"快速更新成功：{time.strftime('%H:%M:%S')}"
-        except Exception as e:
-            st.session_state["kline_auto_last_msg"] = f"快速更新失敗：{e}"
-    else:
-        st.session_state["kline_auto_last_msg"] = "未到新K線時間，略過快速更新。"
-    st.rerun()
-
 # ── Teacher 蒸餾分頁 (index 8) ───────────────────────────────────────────────
 import plotly.graph_objects as _pgo
 
@@ -1905,15 +1950,15 @@ with 分頁[8]:
                 for _col, _color, _name in [("soft_p_long", "#22c55e", "🟢 看漲"), ("soft_p_short", "#ef4444", "🔴 看跌"), ("soft_p_flat", "#64748b", "⚪ 觀望")]:
                     if _col in _sl.columns:
                         _fig_t.add_trace(_pgo.Scatter(x=_x, y=_sl[_col], name=_name, line=dict(color=_color, width=1.2), mode="lines"))
-                _fig_t.update_layout(template="plotly_dark", height=300, margin=dict(l=20,r=20,t=36,b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", title=dict(text=f"Teacher 軟標籤機率（T={_m.get('temperature',2.0)}）", font=dict(size=13,color="#94a3b8")), legend=dict(orientation="h",y=-0.2))
-                st.plotly_chart(_fig_t, use_container_width=True)
+                _fig_t.update_layout(template="plotly_dark", height=300, margin=dict(l=20,r=20,t=36,b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", dragmode="pan", title=dict(text=f"Teacher 軟標籤機率（T={_m.get('temperature',2.0)}）", font=dict(size=13,color="#94a3b8")), legend=dict(orientation="h",y=-0.2))
+                st.plotly_chart(_fig_t, use_container_width=True, config=_plotly_interact_config)
                 _fig_t2 = _pgo.Figure()
                 if "teacher_confidence" in _sl.columns:
                     _fig_t2.add_trace(_pgo.Scatter(x=_x, y=(_sl["teacher_confidence"]*100).round(2), name="Teacher 信心%", line=dict(color="#a78bfa",width=1.5), mode="lines"))
                 if "teacher_leverage" in _sl.columns:
                     _fig_t2.add_trace(_pgo.Scatter(x=_x, y=_sl["teacher_leverage"].round(2), name="Teacher 槓桿", line=dict(color="#f59e0b",width=1.5), mode="lines", yaxis="y2"))
-                _fig_t2.update_layout(template="plotly_dark", height=260, margin=dict(l=20,r=20,t=30,b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", yaxis=dict(title="信心 %",side="left"), yaxis2=dict(title="槓桿",overlaying="y",side="right"), legend=dict(orientation="h",y=-0.25))
-                st.plotly_chart(_fig_t2, use_container_width=True)
+                _fig_t2.update_layout(template="plotly_dark", height=260, margin=dict(l=20,r=20,t=30,b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", dragmode="pan", yaxis=dict(title="信心 %",side="left"), yaxis2=dict(title="槓桿",overlaying="y",side="right"), legend=dict(orientation="h",y=-0.25))
+                st.plotly_chart(_fig_t2, use_container_width=True, config=_plotly_interact_config)
                 st.markdown("**軟標籤樣本（最新 50 筆）**")
                 _sl_show = _sl.tail(50).copy()
                 for _nc in ["soft_p_long","soft_p_short","soft_p_flat","raw_p_long","raw_p_short","teacher_confidence","teacher_leverage"]:
@@ -1927,3 +1972,29 @@ with 分頁[8]:
                 st.info("軟標籤 CSV 尚未產生，請先點擊「訓練 Teacher」。")
         else:
             st.warning("找不到 Teacher 報告檔案。")
+
+# ── 自動刷新循環（非阻塞，避免 sleep+rerun 導致前端殘留重複 UI） ───────────────────
+if 即時更新啟用 or 自動交易啟用:
+    refresh_s = int(min(
+        int(即時更新秒數) if 即時更新啟用 else 3600,
+        int(自動交易秒數) if 自動交易啟用 else 3600
+    ))
+    st.sidebar.caption(f"⏱ 自動循環中，每 {refresh_s} 秒刷新一次。")
+    _reload_ms = max(1000, int(refresh_s) * 1000)
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const ms = {_reload_ms};
+          if (window.__aiDashboardReloadTimer) {{
+            clearTimeout(window.__aiDashboardReloadTimer);
+          }}
+          window.__aiDashboardReloadTimer = setTimeout(function() {{
+            window.location.reload();
+          }}, ms);
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )

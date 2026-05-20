@@ -1,48 +1,43 @@
-param()
+﻿param()
 
 $ErrorActionPreference = "Stop"
-
 Set-Location -LiteralPath $PSScriptRoot
 
 $port = 8600
+$url = "http://127.0.0.1:$port"
 
-if (-not (Test-Path -LiteralPath ".venv\\Scripts\\streamlit.exe")) {
-  Write-Host "[ERROR] 找不到 .venv\\Scripts\\streamlit.exe"
-  Write-Host "請先執行: python -m venv .venv; .venv\\Scripts\\activate; pip install -r requirements.txt"
+$streamlitPath = $null
+if (Test-Path -LiteralPath ".venv311\Scripts\streamlit.exe") {
+  $streamlitPath = ".venv311\Scripts\streamlit.exe"
+} elseif (Test-Path -LiteralPath ".venv\Scripts\streamlit.exe") {
+  $streamlitPath = ".venv\Scripts\streamlit.exe"
+}
+
+if (-not $streamlitPath) {
+  Write-Host "[ERROR] Cannot find .venv311\\Scripts\\streamlit.exe or .venv\\Scripts\\streamlit.exe"
   exit 1
 }
 
 if (-not (Test-Path -LiteralPath "dashboard.py")) {
-  Write-Host "[ERROR] 找不到 dashboard.py"
+  Write-Host "[ERROR] Cannot find dashboard.py"
   exit 1
 }
 
-$logDir = Join-Path $PSScriptRoot "logs"
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$outLog = Join-Path $logDir "streamlit.out.log"
-$errLog = Join-Path $logDir "streamlit.err.log"
-
-Write-Host "[INFO] 啟動儀表板服務 (port $port)..."
-Start-Process -FilePath ".venv\\Scripts\\streamlit.exe" -ArgumentList @("run","dashboard.py","--server.port",$port,"--server.headless","true") -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden
-
-$health = "http://127.0.0.1:$port/_stcore/health"
-Write-Host "[INFO] 等待服務啟動..."
-for ($i=0; $i -lt 40; $i++) {
-  try {
-    $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 $health
-    if ($r.StatusCode -eq 200) { break }
-  } catch { }
-  Start-Sleep -Seconds 1
+$existing = Get-CimInstance Win32_Process | Where-Object {
+  ($_.Name -in @("streamlit.exe", "python.exe", "pythonw.exe")) -and
+  $_.CommandLine -like "*streamlit*" -and
+  $_.CommandLine -like "*dashboard.py*" -and
+  $_.CommandLine -like "*btc-1-k-ai-100-ma*"
 }
 
-try {
-  $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 $health
-  if ($r.StatusCode -ne 200) { throw "health check failed" }
-} catch {
-  Write-Host "[ERROR] 服務沒有成功啟動，請查看 $outLog 與 $errLog"
-  exit 1
+if ($existing) {
+  Write-Host "[INFO] Dashboard already running. Opening browser only."
+  Start-Process $url
+  exit 0
 }
 
-Start-Process "http://127.0.0.1:$port"
-Write-Host "[INFO] 已開啟瀏覽器：http://127.0.0.1:$port"
-Write-Host "[INFO] 伺服器已在背景執行；日誌：$outLog / $errLog"
+Write-Host "[INFO] Starting dashboard service on port $port..."
+Start-Process -FilePath $streamlitPath -ArgumentList @("run", "dashboard.py", "--server.port", $port, "--server.headless", "true") -WindowStyle Hidden
+Start-Sleep -Seconds 2
+Start-Process $url
+Write-Host "[INFO] Dashboard opening: $url"
