@@ -1,0 +1,25 @@
+# Python env
+.venv/
+.venv311/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Runtime artifacts
+logs/
+outputs/
+models/
+data/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
