@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 import pandas as pd
@@ -13,6 +16,122 @@ from .data_sources import interval_to_seconds
 from .features import add_technical_features, build_labels
 from .modeling import infer_signals, load_models, save_models, train_models
 
+
+def _resolve_keep_rows() -> int:
+    try:
+        return max(0, int(os.getenv("KLINE_KEEP_ROWS", "0")))
+    except Exception:
+        return 0
+
+
+def _resolve_start_ms(settings: Settings, fallback_start_ms: int) -> int:
+    keep_rows = _resolve_keep_rows()
+    if keep_rows <= 0:
+        return int(fallback_start_ms)
+    try:
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        interval_ms = int(interval_to_seconds(settings.interval) * 1000)
+        if interval_ms <= 0:
+            return int(fallback_start_ms)
+        overlap_rows = max(200, int((settings.hours_lookback_overlap * 3600 * 1000) / interval_ms))
+        need_rows = int(keep_rows + overlap_rows)
+        return max(0, int(now_ms - need_rows * interval_ms))
+    except Exception:
+        return int(fallback_start_ms)
+
+
+def _limit_recent_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    keep_rows = _resolve_keep_rows()
+    if keep_rows <= 0 or df.empty:
+        return df
+    return df.sort_values("timestamp").tail(keep_rows).reset_index(drop=True)
+
+
+def _read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _copy_model_tree(src: Path, dst: Path) -> None:
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+
+
+def _promotion_gate(
+    candidate_report: dict,
+    current_report: dict | None,
+    settings: Settings,
+) -> tuple[bool, list[str]]:
+    if not current_report:
+        return True, ["no existing production model"]
+    baseline = current_report.get("backtest_report") if isinstance(current_report.get("backtest_report"), dict) else current_report
+    if not isinstance(baseline, dict):
+        return True, ["invalid production report; promoting candidate"]
+
+    reasons: list[str] = []
+
+    cand_trades = int(candidate_report.get("trades") or 0)
+    curr_trades = int(baseline.get("trades") or 0)
+    if cand_trades < max(1, int(settings.promote_min_trades)):
+        reasons.append(f"candidate trades too low ({cand_trades} < {settings.promote_min_trades})")
+    if curr_trades > 0 and cand_trades < curr_trades:
+        reasons.append(f"candidate has fewer trades than production ({cand_trades} < {curr_trades})")
+
+    def _num(report: dict, key: str, default: float = 0.0) -> float:
+        try:
+            value = report.get(key)
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    cand_win = _num(candidate_report, "win_rate")
+    curr_win = _num(baseline, "win_rate")
+    if cand_win < curr_win + float(settings.promote_min_win_rate_delta):
+        reasons.append(
+            f"win_rate not improved enough ({cand_win:.4f} < {curr_win + float(settings.promote_min_win_rate_delta):.4f})"
+        )
+
+    cand_return = _num(candidate_report, "total_return")
+    curr_return = _num(baseline, "total_return")
+    if cand_return < curr_return + float(settings.promote_min_total_return_delta):
+        reasons.append(
+            f"total_return not improved enough ({cand_return:.4f} < {curr_return + float(settings.promote_min_total_return_delta):.4f})"
+        )
+
+    cand_dd = abs(_num(candidate_report, "max_drawdown"))
+    curr_dd = abs(_num(baseline, "max_drawdown"))
+    if cand_dd > curr_dd + float(settings.promote_max_drawdown_increase):
+        reasons.append(
+            f"max_drawdown worse than allowed ({cand_dd:.4f} > {curr_dd + float(settings.promote_max_drawdown_increase):.4f})"
+        )
+
+    cand_pf_raw = candidate_report.get("profit_factor")
+    curr_pf_raw = baseline.get("profit_factor")
+    if cand_pf_raw is not None and curr_pf_raw is not None:
+        try:
+            cand_pf = float(cand_pf_raw)
+            curr_pf = float(curr_pf_raw)
+            if cand_pf < curr_pf + float(settings.promote_min_profit_factor_delta):
+                reasons.append(
+                    f"profit_factor not improved enough ({cand_pf:.4f} < {curr_pf + float(settings.promote_min_profit_factor_delta):.4f})"
+                )
+        except Exception:
+            pass
+
+    return (len(reasons) == 0), reasons
 
 
 def _write_outputs(
@@ -70,11 +189,13 @@ def run_pipeline(
         progress_cb(5, "初始化設定")
 
     # BTC spot data starts long ago; Jan 1, 2017 UTC is a practical baseline.
-    start_ms = int(datetime(2017, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    fallback_start_ms = int(datetime(2017, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    start_ms = _resolve_start_ms(settings, fallback_start_ms)
 
     fetch_settings = settings
 
     ohlcv = load_or_update_ohlcv(fetch_settings, start_ms=start_ms, force_full_refresh=force_full_refresh)
+    ohlcv = _limit_recent_ohlcv(ohlcv)
     if progress_cb:
         progress_cb(25, "市場資料更新完成")
     with_events = merge_event_features(ohlcv, settings)
@@ -112,15 +233,51 @@ def run_pipeline(
     )
     if progress_cb:
         progress_cb(80, "模型訓練完成")
-    model_dir = settings.model_dir / f"{settings.symbol}_{settings.interval}"
-    save_models(models, model_dir)
+    candidate_model_dir = settings.model_dir / "_staged" / tag / datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    production_model_dir = settings.model_dir / tag
+    save_models(models, candidate_model_dir)
 
     inferred = infer_signals(labeled_full, models, settings)
     bt_curve, bt_report = run_backtest(inferred, settings)
     if progress_cb:
         progress_cb(95, "回測完成，寫入輸出檔")
 
+    production_report_path = settings.output_dir / f"production_report_{tag}.json"
+    previous_production_report = _read_json(production_report_path)
+    promote, promote_reasons = _promotion_gate(bt_report, previous_production_report, settings)
+    promoted = False
+    if promote:
+        _copy_model_tree(candidate_model_dir, production_model_dir)
+        promoted = True
+        _write_json(
+            production_report_path,
+            {
+                "tag": tag,
+                "promoted_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+                "candidate_model_dir": str(candidate_model_dir),
+                "production_model_dir": str(production_model_dir),
+                "backtest_report": bt_report,
+                "train_metrics": train_metrics,
+            },
+        )
+
+    promotion_status = {
+        "tag": tag,
+        "candidate_model_dir": str(candidate_model_dir),
+        "production_model_dir": str(production_model_dir),
+        "promoted": promoted,
+        "reasons": promote_reasons if not promoted else ["candidate passed promotion gate"],
+        "candidate_backtest_report": bt_report,
+        "previous_production_report": previous_production_report,
+        "train_metrics": train_metrics,
+        "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    _write_json(settings.output_dir / f"model_promotion_{tag}.json", promotion_status)
+
     out = _write_outputs(inferred, bt_curve, train_metrics, bt_report, settings)
+    out["model_promotion"] = promotion_status
+    _write_json(settings.output_dir / f"report_{tag}.json", out)
+    _write_json(settings.output_dir / "report.json", out)
     if progress_cb:
         progress_cb(100, "全部完成")
     return out
@@ -128,11 +285,13 @@ def run_pipeline(
 
 def run_quick_update(symbol: str | None = None, interval: str | None = None) -> dict:
     settings = Settings(symbol=symbol, interval=interval)
-    start_ms = int(datetime(2017, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    fallback_start_ms = int(datetime(2017, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    start_ms = _resolve_start_ms(settings, fallback_start_ms)
 
     fetch_settings = settings
 
     ohlcv = load_or_update_ohlcv(fetch_settings, start_ms=start_ms, force_full_refresh=False)
+    ohlcv = _limit_recent_ohlcv(ohlcv)
     # Keep quick update fast: only compute on a rolling recent window.
     bars_per_day = int(round((24 * 3600) / interval_to_seconds(settings.interval)))
     window_bars = int(max(500, settings.quick_window_days * bars_per_day))

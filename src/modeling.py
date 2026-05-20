@@ -18,23 +18,18 @@ from sklearn.preprocessing import StandardScaler
 from .config import Settings
 
 
-# ═ 非對稱槓桿懲罰工具 ═════════════════════════════════════════════════════════
 def _asymmetric_lev_weights(
     lev_train: np.ndarray,
     penalty_factor: float = 3.0,
 ) -> np.ndarray:
     """
-    非對稱樣本權重生成器。
-
-    員工邏輯：在合約交易裡，高槓桿區間的預測誤誤代價遠比低槓桿區間大。
-    因此讓模型對小樣本中的高槓桿資料點「付出更大代價」。
-
-    penalty_factor：高槓桿樣本的權重倍數對比導導槓桿樣本（2.0~5.0 為佳）
-    """
+    ??蝔望見?祆??????
+    ?∪極?摩嚗??鈭斗?鋆∴?擃?獢踹????葫隤方炊隞???雿?獢踹??之??    ?迨霈芋??撠見?砌葉??瑽▼鞈?暺??箸憭找誨?嫘?
+    penalty_factor嚗?瑽▼璅????撠?撠?瑽▼璅?嚗?.0~5.0 ?箔蔔嚗?    """
     lev_min, lev_max = lev_train.min(), lev_train.max()
     if lev_max <= lev_min:
         return np.ones(len(lev_train), dtype=np.float64)
-    # 歸一化到 [0, 1]。二次方曲線：槓桿越高、懲罰越大（非線性放大高槓桿區回）
+    # 甇訾?? [0, 1]??甈⊥?脩?嚗?獢輯?擃蝵啗?憭改????扳憭折?瑽▼???
     norm = ((lev_train - lev_min) / (lev_max - lev_min)) ** 2
     weights = 1.0 + (penalty_factor - 1.0) * norm
     return (weights / weights.mean()).clip(0.3, penalty_factor * 1.5)
@@ -46,20 +41,16 @@ def _pinball_sample_weights(
     tau: float = 0.35,
 ) -> np.ndarray:
     """
-    Pinball/Quantile 损失的樣本權重近似。
+    Pinball/Quantile ?仃?見?祆???隡潦?
+    Pinball loss ?砍?嚗?      L(y, y_hat) = (y - y_hat) * tau              ??y >= y_hat  (?葫??)
+      L(y, y_hat) = (y_hat - y) * (1 - tau)        ??y < y_hat   (?葫?? ???脩蔑?游?)
 
-    Pinball loss 公式：
-      L(y, y_hat) = (y - y_hat) * tau              若 y >= y_hat  (預測偏低)
-      L(y, y_hat) = (y_hat - y) * (1 - tau)        若 y < y_hat   (預測偏高 ← 懲罰更多)
-
-    tau=0.35：讓模型倍小心「低估槓桿」，对「高估槓桿」的懲罰為低估的 (1-0.35)/0.35 ≈ 1.86 倍。
-    """
+    tau=0.35嚗?璅∪???敹?隡唳?獢踴?撖嫘?隡唳?獢踴??脩蔑?箔?隡啁? (1-0.35)/0.35 ??1.86 ??    """
     residual = lev_train - lev_pred_warm
-    # 驝許對齊：正數 residual = 顔測唄低、負數 = 顔測偏高
     weights = np.where(
         residual >= 0,
-        tau,            # 沒高估：權重 tau（輕懲罰）
-        (1 - tau),      # 高估槓桿：權重 (1-tau)（重懲罰）
+        tau,
+        1 - tau,
     )
     return (weights / weights.mean()).clip(0.2, 4.0)
 
@@ -71,6 +62,24 @@ class TrainedModels:
     feature_cols: list[str]
     backend: str = "sklearn_rf"
     backend_meta: dict | None = None
+
+
+class EnsembleLevReg:
+    """
+    Top-level ensemble regressor so joblib/pickle can serialize it.
+    Combines a warm-up RF and a quantile GB regressor.
+    """
+
+    def __init__(self, rf: Any, gb: Any, rf_w: float = 0.40) -> None:
+        self.rf = rf
+        self.gb = gb
+        self.rf_w = rf_w
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        rf_p = self.rf.predict(X)
+        gb_p = self.gb.predict(X)
+        blended = self.rf_w * rf_p + (1.0 - self.rf_w) * gb_p
+        return np.clip(blended * 0.95, 1.0, 1e6)
 
 
 class _TorchSignalWrapper:
@@ -239,7 +248,7 @@ def _fit_torch_accelerated(
     n_train = len(x_train_s)
     for ep in range(epochs):
         if progress_cb:
-            progress_cb(66 + int(ep / epochs * 7), f"正在訓練分類模型 (Epoch {ep+1}/{epochs})...")
+            progress_cb(66 + int(ep / epochs * 7), f"甇?閮毀??璅∪? (Epoch {ep+1}/{epochs})...")
         perm = np.random.permutation(n_train)
         for i in range(0, n_train, batch_size):
             idx = perm[i : i + batch_size]
@@ -267,7 +276,7 @@ def _fit_torch_accelerated(
 
     for ep in range(max(3, epochs // 2)):
         if progress_cb:
-            progress_cb(73 + int(ep / max(3, epochs // 2) * 7), f"正在訓練槓桿回歸模型 (Epoch {ep+1}/{max(3, epochs // 2)})...")
+            progress_cb(73 + int(ep / max(3, epochs // 2) * 7), f"甇?閮毀瑽▼?飛璅∪? (Epoch {ep+1}/{max(3, epochs // 2)})...")
         perm = np.random.permutation(n_train)
         for i in range(0, n_train, batch_size):
             idx = perm[i : i + batch_size]
@@ -314,20 +323,20 @@ def _fit_sklearn_rf(
     distill_alpha: float = 0.4,
 ) -> Tuple[TrainedModels, dict]:
     """
-    distill_alpha: Teacher 軟標籤混入比例。0.0=純硬標籤, 1.0=純軟標籤
-    實際擭加方式: y_blend = (1-alpha)*hard + alpha*soft
+    distill_alpha: Teacher 頠?蝐斗毽?交?靘?.0=蝝′璅惜, 1.0=蝝?璅惜
+    撖阡??剖??孵?: y_blend = (1-alpha)*hard + alpha*soft
     """
     x_train = _clean_xy(train_df, feature_cols)
     y_train_hard = train_df["label"].to_numpy(dtype=int)
     x_test = _clean_xy(test_df, feature_cols)
     y_test = test_df["label"]
 
-    # ── 蒸餾混合標籤 ───────────────────────────────────────────
+    # ?? ?賊冗瘛瑕?璅惜 ???????????????????????????????????????????
     distill_applied = False
     sample_weight: np.ndarray | None = None
 
     if soft_labels_df is not None and not soft_labels_df.empty and distill_alpha > 0:
-        # 對齊 timestamp （soft_labels 可能涵蓋全量，取訓練集區間就好）
+        # 撠? timestamp 嚗oft_labels ?航瘨菔??券?嚗?閮毀???停憟踝?
         _sl = soft_labels_df.copy()
         _has_ts = "timestamp" in _sl.columns and "timestamp" in train_df.columns
 
@@ -349,42 +358,38 @@ def _fit_sklearn_rf(
                         soft_p_flat[i]  = float(row.get("soft_p_flat",  1/3))
                         soft_p_short[i] = float(row.get("soft_p_short", 1/3))
         else:
-            # 位置對齊可行時（筆數完全相同）
-            n_match = min(len(train_df), len(_sl))
+            # 雿蔭撠??航???蝑摰?詨?嚗?            n_match = min(len(train_df), len(_sl))
             if "soft_p_long" in _sl.columns:
                 soft_p_long[:n_match]  = _sl["soft_p_long"].values[:n_match]
                 soft_p_flat[:n_match]  = _sl["soft_p_flat"].values[:n_match]
                 soft_p_short[:n_match] = _sl["soft_p_short"].values[:n_match]
 
-        # 混合標籤：軟標籤轉為 class index （取最高機率的類別），再用 alpha 决定樣本權重
-        # 策略：用 teacher 的標籤取代硬標籤，并以 teacher 信心度作為樣本權重調整
-        soft_class_arr = np.array([soft_p_long, soft_p_flat, soft_p_short])  # (3, N)
+        # Teacher soft probabilities -> class index.
+        soft_class_arr = np.array([soft_p_long, soft_p_flat, soft_p_short], dtype=np.float64)  # (3, N)
         soft_pred_idx = np.argmax(soft_class_arr, axis=0)  # 0=long, 1=flat, 2=short
-        class_map = {0: 1, 1: 0, 2: -1}  # 轉回 label 就是軟標籤的主張
+        class_map = {0: 1, 1: 0, 2: -1}  # 頧? label 撠望頠?蝐斤?銝餃撐
         y_soft = np.array([class_map[i] for i in soft_pred_idx], dtype=int)
-        teacher_conf = np.max(soft_class_arr, axis=0)  # 信心度
-
-        # sample_weight: 硬標籤和軟標籤一致 → 權重 1.0；不一致 → 由 alpha*teacher_conf 決定
+        teacher_conf = np.max(soft_class_arr, axis=0)  # 靽∪?摨?
+        # sample_weight: 蝖祆?蝐文?頠?蝐支?????甈? 1.0嚗?銝??????alpha*teacher_conf 瘙箏?
         agree = (y_train_hard == y_soft)
         sample_weight = np.where(
             agree,
             1.0,
             distill_alpha * teacher_conf + (1.0 - distill_alpha) * (1.0 - teacher_conf)
         )
-        sample_weight = (sample_weight / sample_weight.mean()).clip(0.2, 3.0)  # 標準化
-
-        # y_train 改用軟標籤別
+        sample_weight = (sample_weight / sample_weight.mean()).clip(0.2, 3.0)  # 璅???
+        # y_train ?寧頠?蝐文
         y_train_mixed = np.where(agree, y_train_hard, y_soft)
         y_train = pd.Series(y_train_mixed)
         distill_applied = True
         if progress_cb:
             agree_pct = agree.mean() * 100
-            progress_cb(63, f"蒸餾混合完成：Teacher/Student 一致率 {agree_pct:.1f}%，開始訓練...")
+            progress_cb(63, f"?賊冗瘛瑕?摰?嚗eacher/Student 銝?渡? {agree_pct:.1f}%嚗?憪?蝺?..")
     else:
         y_train = pd.Series(y_train_hard)
 
     if progress_cb:
-        progress_cb(68, "正在訓練分類模型 (RandomForest" + (" + Teacher蒸餾" if distill_applied else "") + ")...")
+        progress_cb(68, "甇?閮毀??璅∪? (RandomForest" + (" + Teacher?賊冗" if distill_applied else "") + ")...")
 
     clf = RandomForestClassifier(
         n_estimators=300,
@@ -402,7 +407,7 @@ def _fit_sklearn_rf(
     lev_train = train_df["target_leverage"].clip(1, settings.max_leverage)
     lev_test  = test_df["target_leverage"].clip(1, settings.max_leverage)
 
-    # ── 蒸餾槓桿混合 ─────────────────────────────────────────
+    # ?? ?賊冗瑽▼瘛瑕? ?????????????????????????????????????????
     if distill_applied and soft_labels_df is not None and "teacher_leverage" in soft_labels_df.columns:
         _has_ts2 = "timestamp" in soft_labels_df.columns and "timestamp" in train_df.columns
         soft_lev = lev_train.to_numpy(dtype=np.float64).copy()
@@ -422,20 +427,18 @@ def _fit_sklearn_rf(
         lev_train_arr = lev_train.to_numpy(dtype=np.float64)
     lev_train_arr = np.clip(lev_train_arr, 1.0, float(settings.max_leverage))
 
-    # ── 層 1：非對稱樣本權重（高槓桿區間加重） ───────────────────
     asym_w = _asymmetric_lev_weights(lev_train_arr, penalty_factor=3.0)
-    # 和分類權重合併（如果有蒸餾權重則相乘）
     if sample_weight is not None:
         lev_sample_w = (sample_weight * asym_w)
         lev_sample_w = (lev_sample_w / lev_sample_w.mean()).clip(0.2, 5.0)
     else:
         lev_sample_w = asym_w
 
-    # ── 層 2：先用快速 RF 做 warm-up 預測，再用 Pinball 權重精練 ────
+    # ?? 撅?2嚗??典翰??RF ??warm-up ?葫嚗???Pinball 甈?蝎曄毀 ????
     if progress_cb:
-        progress_cb(74, "正在訓練槓桿回歸 (RF warm-up)...")
+        progress_cb(74, "甇?閮毀瑽▼?飛 (RF warm-up)...")
     rf_warm = RandomForestRegressor(
-        n_estimators=50,   # 快速 warm-up
+        n_estimators=50,   # 敹恍?warm-up
         max_depth=6,
         min_samples_leaf=10,
         random_state=42,
@@ -444,27 +447,26 @@ def _fit_sklearn_rf(
     rf_warm.fit(x_train, lev_train_arr, sample_weight=lev_sample_w)
     lev_pred_warm = rf_warm.predict(x_train)
 
-    # Pinball 權重：對高估槓桿的樣本加重 1.86×（tau=0.35）
+    # Pinball-style weighting: penalize over-estimated leverage more.
     pinball_w = _pinball_sample_weights(lev_train_arr, lev_pred_warm, tau=0.35)
     final_lev_w = (lev_sample_w * pinball_w)
     final_lev_w = (final_lev_w / final_lev_w.mean()).clip(0.15, 6.0)
 
-    # ── 層 3：用 GradientBoosting Quantile 回歸（內建非對稱 loss） ──
+    # ?? 撅?3嚗 GradientBoosting Quantile ?飛嚗撱粹?撠迂 loss嚗???
     if progress_cb:
-        progress_cb(78, "正在訓練槓桿回歸 (GB Quantile loss, tau=0.35)...")
+        progress_cb(78, "甇?閮毀瑽▼?飛 (GB Quantile loss, tau=0.35)...")
     gb_lev = GradientBoostingRegressor(
         n_estimators=200,
         max_depth=5,
         learning_rate=0.05,
         subsample=0.8,
         min_samples_leaf=10,
-        loss="quantile",      # 內建 Pinball loss
-        alpha=0.35,           # 預測第 35 百分位 → 天生保守側
-        random_state=42,
+        loss="quantile",      # ?批遣 Pinball loss
+        alpha=0.35,           # ?葫蝚?35 ?曉?雿???憭拍?靽???        random_state=42,
     )
     gb_lev.fit(x_train, lev_train_arr, sample_weight=final_lev_w)
 
-    # 子 RF：用兩個模型的平均，努力順滑複雜場景
+    # RF leverage warm model
     lev_reg_rf = RandomForestRegressor(
         n_estimators=300,
         max_depth=8,
@@ -473,33 +475,17 @@ def _fit_sklearn_rf(
         n_jobs=-1,
     )
     lev_reg_rf.fit(x_train, lev_train_arr, sample_weight=final_lev_w)
+    lev_reg = EnsembleLevReg(lev_reg_rf, gb_lev, rf_w=0.40)
 
-    # 集成两個槓桿模型： RF 40% + GB(quantile) 60%
-    class _EnsembleLevReg:
-        """RF + GB Quantile 集成槓桿回歸，內部封裝。"""
-        def __init__(self, rf, gb, rf_w=0.40):
-            self.rf, self.gb, self.rf_w = rf, gb, rf_w
-
-        def predict(self, X):
-            rf_p = self.rf.predict(X)
-            gb_p = self.gb.predict(X)
-            # GB(quantile) 天生保守；集成後再乘上安全係數 0.95
-            blended = self.rf_w * rf_p + (1 - self.rf_w) * gb_p
-            return np.clip(blended * 0.95, 1.0, 1e6)  # 0.95 不對稱安全帶
-
-        def __getstate__(self): return self.__dict__
-        def __setstate__(self, d): self.__dict__.update(d)
-
-    lev_reg = _EnsembleLevReg(lev_reg_rf, gb_lev, rf_w=0.40)
-
-    # 評估：在測試集計算 MAE
+    # Evaluate leverage regression on the test split.
     lev_pred = lev_reg.predict(x_test)
-    lev_mae  = mean_absolute_error(lev_test.to_numpy(), lev_pred)
-    # 配步計算：高估率（预測 > 真實 的樣本比例）
+    lev_mae = mean_absolute_error(lev_test.to_numpy(), lev_pred)
     overestimate_rate = float((lev_pred > lev_test.to_numpy()).mean())
 
     models = TrainedModels(
-        clf=clf, lev_reg=lev_reg, feature_cols=feature_cols,
+        clf=clf,
+        lev_reg=lev_reg,
+        feature_cols=feature_cols,
         backend="sklearn_rf",
         backend_meta={
             "device": "cpu",
@@ -530,10 +516,8 @@ def train_models(
     soft_labels_df: pd.DataFrame | None = None,
     distill_alpha: float = 0.4,
 ) -> Tuple[TrainedModels, dict]:
-    """
-    soft_labels_df : Teacher 產生的軟標籤 DataFrame（含 timestamp, soft_p_long, soft_p_short 等）
-    distill_alpha  : 軟標籤混入比例（0.4 = 60% 硬標籤 + 40% 軟標籤）
-    """
+    # soft_labels_df: Teacher soft-label DataFrame with timestamp and soft probabilities.
+    # distill_alpha: 0.4 means 60% hard labels + 40% teacher guidance.
     max_rows = int(getattr(settings, "max_train_rows", 0) or 0)
     if max_rows > 0 and len(df) > max_rows:
         df = df.tail(max_rows).reset_index(drop=True)
@@ -548,14 +532,14 @@ def train_models(
 
     requested = str(settings.train_device or "auto").lower()
 
-    # ── CPU 模式：支援蒸餾 ──────────────────────────────────
+    # ?? CPU 璅∪?嚗?渲擗???????????????????????????????????
     if requested == "cpu":
         return _fit_sklearn_rf(
             train_df, test_df, feature_cols, settings, progress_cb,
             soft_labels_df=soft_labels_df, distill_alpha=distill_alpha,
         )
 
-    # ── 加速模式：嘗試 torch，失敗則 fallback 到 sklearn（含蒸餾） ───────
+    # ?? ?芋撘??岫 torch嚗仃?? fallback ??sklearn嚗?賊冗嚗????????
     if requested in {"auto", "cloud", "npu", "directml", "cuda", "gpu", "mps"}:
         try:
             return _fit_torch_accelerated(train_df, test_df, feature_cols, settings, requested, progress_cb)
@@ -609,13 +593,10 @@ def load_models(model_dir: Path) -> TrainedModels:
         try:
             import torch  # type: ignore
         except Exception as torch_err:  # noqa: BLE001
-            # ── torch 不可用：自動降級到 sklearn ─────────────────────────
             if _has_sklearn:
                 import warnings
                 warnings.warn(
-                    f"[load_models] torch 不可用（{torch_err}），"
-                    "已自動降級使用 sklearn 模型（推理速度稍慢）。"
-                    " 若需加速推理，請改用 .venv311 環境啟動儀表板。",
+                    f"[load_models] torch unavailable ({torch_err}); using sklearn fallback.",
                     stacklevel=2,
                 )
                 clf = joblib.load(clf_path)
@@ -626,17 +607,13 @@ def load_models(model_dir: Path) -> TrainedModels:
                     backend="sklearn_rf",
                     backend_meta={"device": "cpu", "note": "torch_unavailable_sklearn_fallback"},
                 )
-            # sklearn 模型也不存在 → 給出清楚的操作指引
             raise RuntimeError(
-                f"torch 模型存在但 torch 無法載入（{torch_err}）。\n"
-                "解決方法（二選一）：\n"
-                "  1. 用 .venv311 啟動："
-                ".venv311\\Scripts\\streamlit.exe run dashboard.py --server.port 8502\n"
-                "  2. 在目前環境重新訓練（點擊「增量更新+重訓回測」），"
-                "系統會自動降級為 CPU/sklearn 模式並儲存 .joblib 檔案。"
+                f"torch is required but unavailable: {torch_err}\n"
+                "Use the local .venv311 to run the dashboard or install a torch-compatible environment.\n"
+                "If you only need inference, keep the sklearn .joblib models available.",
             ) from torch_err
 
-        # ── torch 可用，正常載入 torch bundle ───────────────────────────
+        # ?? torch ?舐嚗迤撣貉???torch bundle ???????????????????????????
         bundle = torch.load(torch_bundle_path, map_location="cpu")
         backend_name = str(bundle.get("backend", "torch_accel"))
         meta = bundle.get("backend_meta") or {}
@@ -677,11 +654,9 @@ def load_models(model_dir: Path) -> TrainedModels:
             backend_meta=meta,
         )
 
-    # ── 沒有 torch bundle，直接載入 sklearn ─────────────────────────────
     if not _has_sklearn:
         raise FileNotFoundError(
-            "找不到任何已儲存的模型檔案。\n"
-            "請先執行左側「增量更新+重訓回測」或「重新抓取全歷史」來訓練並儲存模型。"
+            "No torch bundle was found, and the fallback sklearn .joblib files are missing.",
         )
 
     clf = joblib.load(clf_path)
@@ -721,7 +696,7 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
     out["suggested_leverage"] = leverage.round(2)
     out["max_safe_leverage"] = max_safe_lev.round(2)
 
-    # ── AI 信心指數 & 市場風格（每根 K 線自動評分） ─────────────────────
+    # ?? AI 靽∪?? & 撣憸冽嚗???K 蝺???? ?????????????????????
     confidence_index = np.maximum(p_long + p_short - p_flat, 0.0)
     out["confidence_index"] = confidence_index.round(4)
 
@@ -752,9 +727,12 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
         elif dd < -0.08:   s -= 0.5
 
         s = max(-3.0, min(3.0, s))
-        if s >= 0.8:   return "激進"
-        elif s <= -0.6: return "保守"
-        else:           return "中立"
+        if s >= 0.8:
+            return "aggressive"
+        elif s <= -0.6:
+            return "conservative"
+        else:
+            return "neutral"
 
     out["ai_style"] = [_classify_row_style(i) for i in range(len(out))]
     return out

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import hashlib
@@ -128,6 +128,9 @@ class OKXClient:
 
     def get_account_config(self) -> dict[str, Any]:
         return self._request("GET", "/api/v5/account/config", auth=True)
+
+    def get_balance(self, ccy: str = "USDT") -> dict[str, Any]:
+        return self._request("GET", "/api/v5/account/balance", params={"ccy": ccy}, auth=True)
 
     def set_leverage(
         self,

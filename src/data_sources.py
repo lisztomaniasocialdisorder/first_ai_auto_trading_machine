@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,7 @@ import requests
 
 from .config import Settings
 from .cache import JsonCache
+from .macro_events import generate_estimated_macro_events
 
 
 INTERVAL_TO_MS = {
@@ -140,11 +142,17 @@ def load_or_update_ohlcv(settings: Settings, start_ms: int, force_full_refresh: 
     csv_path = settings.data_dir / f"{settings.symbol}_{settings.interval}_ohlcv.csv"
     pq_path = settings.data_dir / f"{settings.symbol}_{settings.interval}_ohlcv.parquet"
     client = BinanceClient(settings)
+    try:
+        keep_rows = max(0, int(os.getenv("KLINE_KEEP_ROWS", "0")))
+    except Exception:
+        keep_rows = 0
 
     if force_full_refresh or (not csv_path.exists() and not pq_path.exists()):
         df = client.fetch_all_history(settings.symbol, settings.interval, start_ms=start_ms)
         if df.empty:
             raise RuntimeError("No OHLCV data fetched in full refresh.")
+        if keep_rows > 0:
+            df = df.sort_values("timestamp").tail(keep_rows).reset_index(drop=True)
         df.to_parquet(pq_path, index=False)
         df.to_csv(csv_path, index=False)
         return df
@@ -163,12 +171,18 @@ def load_or_update_ohlcv(settings: Settings, start_ms: int, force_full_refresh: 
 
     new_tail = client.fetch_all_history(settings.symbol, settings.interval, start_ms=from_ms)
     if new_tail.empty:
+        if keep_rows > 0 and len(old) > keep_rows:
+            old = old.sort_values("timestamp").tail(keep_rows).reset_index(drop=True)
+            old.to_parquet(pq_path, index=False)
+            old.to_csv(csv_path, index=False)
         return old
 
     keep = old[old["open_time"] < from_ms]
     merged = pd.concat([keep, new_tail], ignore_index=True)
     merged = merged.drop_duplicates(subset=["open_time"], keep="last")
     merged = merged.sort_values("timestamp").reset_index(drop=True)
+    if keep_rows > 0:
+        merged = merged.tail(keep_rows).reset_index(drop=True)
 
     merged.to_parquet(pq_path, index=False)
     merged.to_csv(csv_path, index=False)
@@ -222,6 +236,10 @@ def _topic_scores(text: str) -> dict[str, float]:
     reg_kw = ["regulation", "regulator", "law", "lawsuit", "ban", "compliance", "sec"]
     exch_kw = ["binance", "coinbase", "kraken", "exchange", "delist", "listing", "maintenance", "outage"]
     black_swan_kw = ["hack", "bankrupt", "collapse", "exploit", "fraud", "war", "sanction", "liquidation cascade"]
+    fed_kw = ["federal reserve", "fed", "fomc", "powell", "rate hike", "rate cut", "美聯儲", "聯準會"]
+    trump_kw = ["trump", "donald trump", "川普"]
+    panic_kw = ["panic", "bank run", "credit stress", "liquidity crunch", "contagion", "fear spike", "恐慌", "擠兌", "流動性危機"]
+    war_kw = ["war", "invasion", "missile", "airstrike", "military conflict", "sanction", "戰爭", "衝突", "制裁"]
 
     def score(keys: list[str]) -> float:
         return float(sum(1 for k in keys if k in t))
@@ -231,6 +249,10 @@ def _topic_scores(text: str) -> dict[str, float]:
         "regulatory_news_score": score(reg_kw),
         "exchange_event_score": score(exch_kw),
         "black_swan_risk_score": score(black_swan_kw),
+        "fed_news_score": score(fed_kw),
+        "trump_news_score": score(trump_kw),
+        "panic_news_score": score(panic_kw),
+        "war_news_score": score(war_kw),
     }
 
 
@@ -251,6 +273,10 @@ def fetch_cryptopanic_news(
                 "regulatory_news_score",
                 "exchange_event_score",
                 "black_swan_risk_score",
+                "fed_news_score",
+                "trump_news_score",
+                "panic_news_score",
+                "war_news_score",
             ]
         )
 
@@ -282,17 +308,20 @@ def fetch_cryptopanic_news(
             break
 
         for row in results:
-            title = row.get("title") or ""
+            title = str(row.get("title") or "")
+            body = str(row.get("body") or "")
+            text_all = f"{title} {body}".strip()
             published = row.get("published_at")
-            score = _simple_sentiment_score(title)
+            score = _simple_sentiment_score(text_all)
             shock = 1 if abs(score) >= 2 else 0
-            topics = _topic_scores(title)
+            topics = _topic_scores(text_all)
             all_rows.append(
                 {
                     "published_at": published,
                     "news_sentiment": score,
                     "news_shock": shock,
                     "title": title,
+                    "body": body,
                     **topics,
                 }
             )
@@ -316,11 +345,16 @@ def merge_event_features(price_df: pd.DataFrame, settings: Settings, fast_mode: 
     df = df.merge(fg, on="date", how="left")
     df["fear_greed_value"] = df["fear_greed_value"].ffill().bfill()
 
-    if fast_mode:
-        news = pd.DataFrame()
-    else:
-        news_cache = str(settings.data_dir / "cache_cryptopanic.json")
-        news = fetch_cryptopanic_news(settings.cryptopanic_auth_token, currency="BTC", pages=8, cache_path=news_cache, max_age_seconds=15 * 60)
+    # Keep checking macro/news flow regularly for both normal and quick update flows.
+    news_cache = str(settings.data_dir / "cache_cryptopanic.json")
+    _pages = 4 if fast_mode else 10
+    news = fetch_cryptopanic_news(
+        settings.cryptopanic_auth_token,
+        currency="BTC",
+        pages=_pages,
+        cache_path=news_cache,
+        max_age_seconds=60 * 60,  # hourly refresh
+    )
     if not news.empty:
         news["hour"] = news["published_at"].dt.floor("h")
         hourly_news = (
@@ -332,9 +366,19 @@ def merge_event_features(price_df: pd.DataFrame, settings: Settings, fast_mode: 
                 regulatory_news_score=("regulatory_news_score", "mean"),
                 exchange_event_score=("exchange_event_score", "mean"),
                 black_swan_risk_score=("black_swan_risk_score", "mean"),
+                fed_news_score=("fed_news_score", "sum"),
+                trump_news_score=("trump_news_score", "sum"),
+                panic_news_score=("panic_news_score", "sum"),
+                war_news_score=("war_news_score", "sum"),
             )
             .rename(columns={"hour": "timestamp"})
         )
+        # Persist hourly news features for traceability/training audits.
+        try:
+            tag = f"{settings.symbol}_{settings.interval}"
+            hourly_news.to_csv(settings.data_dir / f"news_hourly_{tag}.csv", index=False, encoding="utf-8")
+        except Exception:
+            pass
         df = df.merge(hourly_news, on="timestamp", how="left")
     else:
         df["news_sentiment"] = np.nan
@@ -343,6 +387,46 @@ def merge_event_features(price_df: pd.DataFrame, settings: Settings, fast_mode: 
         df["regulatory_news_score"] = np.nan
         df["exchange_event_score"] = np.nan
         df["black_swan_risk_score"] = np.nan
+        df["fed_news_score"] = np.nan
+        df["trump_news_score"] = np.nan
+        df["panic_news_score"] = np.nan
+        df["war_news_score"] = np.nan
+
+    # Add estimated fixed-time macro events (CPI/PPI/FOMC) to features.
+    _start = pd.to_datetime(df["timestamp"].min(), utc=True)
+    _end = pd.to_datetime(df["timestamp"].max(), utc=True) + pd.Timedelta(days=120)
+    macro_events = generate_estimated_macro_events(_start, _end)
+    if not macro_events.empty:
+        macro_events = macro_events.copy()
+        macro_events["timestamp"] = pd.to_datetime(macro_events["timestamp"], utc=True).dt.floor("h")
+        macro_hourly = (
+            macro_events.groupby("timestamp", as_index=False)
+            .agg(
+                macro_event_count=("event_name", "count"),
+                macro_event_risk_score=("risk_weight", "sum"),
+            )
+        )
+        df = df.merge(macro_hourly, on="timestamp", how="left")
+        # Time to next macro event in hours.
+        ev_ts = pd.to_datetime(macro_events["timestamp"], utc=True).sort_values().unique()
+        if len(ev_ts) > 0:
+            ev_index = pd.DatetimeIndex(ev_ts)
+            ts_arr = pd.to_datetime(df["timestamp"], utc=True)
+            next_pos = ev_index.searchsorted(ts_arr, side="left")
+            hours_to_next: list[float] = []
+            for i, pos in enumerate(next_pos):
+                if pos >= len(ev_index):
+                    hours_to_next.append(np.nan)
+                else:
+                    delta_h = (ev_index[pos] - ts_arr.iloc[i]).total_seconds() / 3600.0
+                    hours_to_next.append(float(delta_h))
+            df["hours_to_next_macro_event"] = hours_to_next
+        else:
+            df["hours_to_next_macro_event"] = np.nan
+    else:
+        df["macro_event_count"] = np.nan
+        df["macro_event_risk_score"] = np.nan
+        df["hours_to_next_macro_event"] = np.nan
 
     df["news_sentiment"] = df["news_sentiment"].fillna(0.0)
     df["news_shock"] = df["news_shock"].fillna(0)
@@ -350,4 +434,21 @@ def merge_event_features(price_df: pd.DataFrame, settings: Settings, fast_mode: 
     df["regulatory_news_score"] = df["regulatory_news_score"].fillna(0.0)
     df["exchange_event_score"] = df["exchange_event_score"].fillna(0.0)
     df["black_swan_risk_score"] = df["black_swan_risk_score"].fillna(0.0)
+    df["fed_news_score"] = df["fed_news_score"].fillna(0.0)
+    df["trump_news_score"] = df["trump_news_score"].fillna(0.0)
+    df["panic_news_score"] = df["panic_news_score"].fillna(0.0)
+    df["war_news_score"] = df["war_news_score"].fillna(0.0)
+    df["macro_event_count"] = df["macro_event_count"].fillna(0.0)
+    df["macro_event_risk_score"] = df["macro_event_risk_score"].fillna(0.0)
+    df["hours_to_next_macro_event"] = pd.to_numeric(df["hours_to_next_macro_event"], errors="coerce")
+    df["macro_event_within_24h"] = ((df["hours_to_next_macro_event"] >= 0) & (df["hours_to_next_macro_event"] <= 24)).astype(float)
+
+    # Composite market-panic signal for trading/risk control.
+    df["market_panic_score"] = (
+        1.2 * df["panic_news_score"]
+        + 1.5 * df["war_news_score"]
+        + 0.8 * df["black_swan_risk_score"]
+        + 0.4 * df["macro_event_risk_score"]
+        + np.where(df["fear_greed_value"] <= 25, 1.0, 0.0)
+    )
     return df

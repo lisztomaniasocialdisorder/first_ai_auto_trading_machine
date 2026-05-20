@@ -25,6 +25,8 @@ class OKXTradeConfig:
     # Position sizing
     notional_usdt: float | None = None
     max_leverage: int | None = None
+    black_swan_reserve_usdt: float | None = None
+    black_swan_threshold: float | None = None
 
     def __post_init__(self) -> None:
         self.inst_id = self.inst_id or os.getenv("OKX_INST_ID", "BTC-USDT-SWAP")
@@ -37,6 +39,8 @@ class OKXTradeConfig:
 
         self.notional_usdt = float(self.notional_usdt or os.getenv("OKX_NOTIONAL_USDT", "50"))
         self.max_leverage = int(self.max_leverage or os.getenv("OKX_MAX_LEVERAGE", "100"))
+        self.black_swan_reserve_usdt = float(self.black_swan_reserve_usdt or os.getenv("OKX_BLACK_SWAN_RESERVE_USDT", "0"))
+        self.black_swan_threshold = float(self.black_swan_threshold or os.getenv("OKX_BLACK_SWAN_THRESHOLD", "1.0"))
 
 
 def _okx_client_from_env(cfg: OKXTradeConfig) -> OKXClient:
@@ -67,6 +71,33 @@ def _load_latest_price(outputs_dir: Path, symbol: str, interval: str) -> float:
     return float(df["close"].iloc[-1])
 
 
+def _load_latest_signal_row(outputs_dir: Path, symbol: str, interval: str) -> dict[str, Any]:
+    tag = f"{symbol}_{interval}"
+    p = outputs_dir / f"signals_with_features_{tag}.csv"
+    if not p.exists():
+        p = outputs_dir / "signals_with_features.csv"
+    df = pd.read_csv(p)
+    if df.empty:
+        return {}
+    return df.iloc[-1].to_dict()
+
+
+def _extract_usdt_balance(balance_resp: dict[str, Any]) -> float | None:
+    data = balance_resp.get("data") or []
+    if not data:
+        return None
+    details = data[0].get("details") or []
+    for d in details:
+        if str(d.get("ccy", "")).upper() != "USDT":
+            continue
+        for k in ("availBal", "eq", "cashBal"):
+            try:
+                return float(d.get(k) or 0)
+            except Exception:
+                continue
+    return None
+
+
 def _pick_pos_side(pos_mode: str, desired: int) -> Optional[str]:
     if pos_mode == "net":
         return None
@@ -80,6 +111,41 @@ def _pick_pos_side(pos_mode: str, desired: int) -> Optional[str]:
 def _looks_like_posside_error(exc: Exception) -> bool:
     s = str(exc)
     return ("51000" in s) and ("posSide" in s or "posside" in s)
+
+
+def _position_side_and_size(pos_row: dict[str, Any]) -> tuple[Optional[Literal["long", "short"]], float]:
+    """
+    Normalize OKX position record to (side, abs_size).
+    In net mode, posSide is usually 'net' and signed pos indicates side.
+    """
+    raw = float(pos_row.get("pos") or 0)
+    if raw == 0:
+        return None, 0.0
+    side = str(pos_row.get("posSide") or "").lower()
+    if side == "long":
+        return "long", abs(raw)
+    if side == "short":
+        return "short", abs(raw)
+    # net/empty: infer from signed quantity
+    return ("long", abs(raw)) if raw > 0 else ("short", abs(raw))
+
+
+def _close_order_args(
+    cfg: "OKXTradeConfig",
+    side: Literal["long", "short"],
+    size: float,
+) -> dict[str, Any]:
+    close_side: Literal["buy", "sell"] = "sell" if side == "long" else "buy"
+    close_pos_side = side if cfg.pos_mode == "long_short" else None
+    return {
+        "instId": cfg.inst_id,
+        "tdMode": cfg.td_mode,
+        "side": close_side,
+        "ordType": "market",
+        "sz": str(abs(size)),
+        "posSide": close_pos_side,
+        "reduceOnly": True,
+    }
 
 
 def _pos_mode_from_account_config(cfg_resp: dict[str, Any]) -> str:
@@ -148,12 +214,43 @@ def execute_latest_signal_okx(
         cfg.pos_mode = _pos_mode_from_account_config(acct_cfg)
 
     decision = _load_latest_decision(outputs_dir, symbol, interval)
+    latest_row = _load_latest_signal_row(outputs_dir, symbol, interval)
     sig = int(decision.get("signal", 0))
     suggested_lev = float(decision.get("suggested_leverage", 1.0))
-    price = float(decision.get("price", 0.0)) or _load_latest_price(outputs_dir, symbol, interval)
+    price = float(decision.get("price", 0.0) or latest_row.get("close", 0.0) or 0.0) or _load_latest_price(outputs_dir, symbol, interval)
+    black_swan_score = float(latest_row.get("black_swan_risk_score", 0.0) or 0.0)
+    panic_news_score = float(latest_row.get("panic_news_score", 0.0) or 0.0)
+    war_news_score = float(latest_row.get("war_news_score", 0.0) or 0.0)
+    macro_event_risk_score = float(latest_row.get("macro_event_risk_score", 0.0) or 0.0)
+    market_panic_score = float(latest_row.get("market_panic_score", 0.0) or 0.0)
+    mode = action_override or "AUTO"
+
+    effective_notional_usdt = float(cfg.notional_usdt)
+    hold_due_to_black_swan = False
+    risk_control_note = ""
+    black_swan_active = bool(cfg.black_swan_reserve_usdt > 0 and black_swan_score >= cfg.black_swan_threshold)
+
+    # User policy:
+    # - In black swan state, AUTO mode must pause (manual decisions only).
+    # - Reserve capital is a manual buffer and must not be auto-operated.
+    if black_swan_active and mode == "AUTO":
+        hold_due_to_black_swan = True
+        risk_control_note = "hold: black swan active, auto trading paused; manual control only"
+
+    # For AUTO mode (non-black-swan hold), cap notional by reserve policy.
+    if (not hold_due_to_black_swan) and mode == "AUTO" and cfg.black_swan_reserve_usdt > 0:
+        try:
+            bal_resp = client.get_balance("USDT")
+            usdt_balance = _extract_usdt_balance(bal_resp)
+        except Exception:
+            usdt_balance = None
+        if usdt_balance is not None:
+            effective_notional_usdt = min(float(cfg.notional_usdt), max(0.0, float(usdt_balance) - float(cfg.black_swan_reserve_usdt)))
+            if effective_notional_usdt < 5.0:
+                hold_due_to_black_swan = True
+                risk_control_note = "hold: black swan reserve leaves notional below minimum"
 
     # Decide desired action
-    mode = action_override or "AUTO"
     if mode == "LONG":
         desired = 1
     elif mode == "SHORT":
@@ -163,7 +260,27 @@ def execute_latest_signal_okx(
     else:
         desired = 1 if sig > 0 else (-1 if sig < 0 else 0)
 
+    # Auto risk regime from news/events:
+    # - If panic rises (but not severe black swan hold), bias to defensive short.
+    panic_regime = bool((market_panic_score >= 2.0) or (panic_news_score >= 1.0) or (war_news_score >= 1.0))
+    if mode == "AUTO" and panic_regime and not hold_due_to_black_swan:
+        desired = -1
+        risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "panic regime: prefer short"
+
+    if hold_due_to_black_swan and mode != "CLOSE":
+        desired = 0
+
     lever = int(leverage_override or min(cfg.max_leverage, max(1, int(round(suggested_lev)))))
+    if mode == "AUTO":
+        if macro_event_risk_score > 0:
+            # CPI/PPI/FOMC release windows: auto reduce risk.
+            lever = max(1, int(round(lever * 0.5)))
+            effective_notional_usdt = max(5.0, float(effective_notional_usdt) * 0.6)
+            risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "macro release window: reduced leverage/notional"
+        if panic_regime:
+            lever = max(1, min(lever, 3))
+            effective_notional_usdt = max(5.0, float(effective_notional_usdt) * 0.7)
+            risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "panic: leverage capped"
 
     pos_side = _pick_pos_side(cfg.pos_mode, desired)
 
@@ -205,7 +322,10 @@ def execute_latest_signal_okx(
             except Exception:
                 pass
 
+    original_notional = float(cfg.notional_usdt)
+    cfg.notional_usdt = float(effective_notional_usdt)
     sz = _calc_swap_contract_size(client, cfg, price) if cfg.inst_type in ("SWAP", "FUTURES") else str(cfg.notional_usdt)
+    cfg.notional_usdt = original_notional
 
     action: Literal["HOLD", "OPEN_LONG", "OPEN_SHORT", "CLOSE"] = "HOLD"
     order_resp = None
@@ -221,44 +341,22 @@ def execute_latest_signal_okx(
                 p_inst = p.get("instId")
                 if p_inst != cfg.inst_id:
                     continue
-                p_pos = float(p.get("pos") or 0)
-                if p_pos == 0:
+                p_side, p_size = _position_side_and_size(p)
+                if p_side is None or p_size <= 0:
                     continue
-                p_side = str(p.get("posSide") or "").lower()  # long/short or empty (net)
-                if p_side == "long":
-                    side = "sell"
-                    ps = "long" if cfg.pos_mode == "long_short" else None
-                    sz = str(abs(p_pos))
-                elif p_side == "short":
-                    side = "buy"
-                    ps = "short" if cfg.pos_mode == "long_short" else None
-                    sz = str(abs(p_pos))
-                else:
-                    # net mode: if we cannot infer, skip.
-                    continue
+                args = _close_order_args(cfg, p_side, p_size)
 
                 if not cfg.enable_trading:
-                    close_orders.append(
-                        {
-                            "dry_run": True,
-                            "instId": cfg.inst_id,
-                            "tdMode": cfg.td_mode,
-                            "side": side,
-                            "ordType": "market",
-                            "sz": sz,
-                            "posSide": ps,
-                            "reduceOnly": True,
-                        }
-                    )
+                    close_orders.append({"dry_run": True, **args})
                 else:
                     close_orders.append(
                         client.place_order(
-                            inst_id=cfg.inst_id,
-                            td_mode=cfg.td_mode,
-                            side=side,
-                            ord_type="market",
-                            sz=sz,
-                            pos_side=ps,
+                            inst_id=args["instId"],
+                            td_mode=args["tdMode"],
+                            side=args["side"],
+                            ord_type=args["ordType"],
+                            sz=args["sz"],
+                            pos_side=args["posSide"],
                             reduce_only=True,
                             lever=None,
                         )
@@ -270,22 +368,85 @@ def execute_latest_signal_okx(
             order_resp = {"note": "no open positions found", "positions": pdata}
     elif desired == 0:
         action = "HOLD"
+        if risk_control_note:
+            order_resp = {"note": risk_control_note}
     else:
         action = "OPEN_LONG" if desired > 0 else "OPEN_SHORT"
         side: Literal["buy", "sell"] = "buy" if desired > 0 else "sell"
-        if not cfg.enable_trading:
-            order_resp = {"dry_run": True, "instId": cfg.inst_id, "tdMode": cfg.td_mode, "side": side, "ordType": "market", "sz": sz, "posSide": pos_side, "lever": lever}
+        desired_side: Literal["long", "short"] = "long" if desired > 0 else "short"
+
+        # Safety pre-check: avoid stacking same-side positions and close opposite side first.
+        pos = client.get_positions(inst_type=cfg.inst_type, inst_id=cfg.inst_id)
+        pdata = pos.get("data") or []
+        same_side = 0.0
+        opp_side = 0.0
+        opposite_close_orders: list[dict[str, Any]] = []
+        for p in pdata:
+            if p.get("instId") != cfg.inst_id:
+                continue
+            p_side, p_size = _position_side_and_size(p)
+            if p_side is None or p_size <= 0:
+                continue
+            if p_side == desired_side:
+                same_side += p_size
+            else:
+                opp_side += p_size
+                opposite_close_orders.append(_close_order_args(cfg, p_side, p_size))
+
+        if same_side > 0 and opp_side == 0:
+            action = "HOLD"
+            order_resp = {
+                "note": "already in desired-side position, skip duplicate open",
+                "desired_side": desired_side,
+                "same_side_size": same_side,
+            }
         else:
-            order_resp = client.place_order(
-                inst_id=cfg.inst_id,
-                td_mode=cfg.td_mode,
-                side=side,
-                ord_type="market",
-                sz=sz,
-                pos_side=pos_side,
-                reduce_only=False,
-                lever=lever,
-            )
+            close_results: list[dict[str, Any]] = []
+            if opposite_close_orders:
+                if not cfg.enable_trading:
+                    close_results = [{"dry_run": True, **o} for o in opposite_close_orders]
+                else:
+                    for o in opposite_close_orders:
+                        close_results.append(
+                            client.place_order(
+                                inst_id=o["instId"],
+                                td_mode=o["tdMode"],
+                                side=o["side"],
+                                ord_type=o["ordType"],
+                                sz=o["sz"],
+                                pos_side=o["posSide"],
+                                reduce_only=True,
+                                lever=None,
+                            )
+                        )
+
+            if not cfg.enable_trading:
+                open_resp: dict[str, Any] = {
+                    "dry_run": True,
+                    "instId": cfg.inst_id,
+                    "tdMode": cfg.td_mode,
+                    "side": side,
+                    "ordType": "market",
+                    "sz": sz,
+                    "posSide": pos_side,
+                    "lever": lever,
+                }
+            else:
+                open_resp = client.place_order(
+                    inst_id=cfg.inst_id,
+                    td_mode=cfg.td_mode,
+                    side=side,
+                    ord_type="market",
+                    sz=sz,
+                    pos_side=pos_side,
+                    reduce_only=False,
+                    lever=lever,
+                )
+
+            order_resp = {
+                "close_opposite_before_open": close_results,
+                "open_order": open_resp,
+            }
 
     return {
         "instId": cfg.inst_id,
@@ -300,4 +461,18 @@ def execute_latest_signal_okx(
         "size": sz,
         "set_leverage_response": lev_resp,
         "order_response": order_resp,
+        "effective_notional_usdt": float(effective_notional_usdt),
+        "risk_controls": {
+            "black_swan_score": float(black_swan_score),
+            "black_swan_threshold": float(cfg.black_swan_threshold),
+            "black_swan_reserve_usdt": float(cfg.black_swan_reserve_usdt),
+            "black_swan_active": bool(black_swan_active),
+            "hold_due_to_black_swan": bool(hold_due_to_black_swan),
+            "panic_news_score": float(panic_news_score),
+            "war_news_score": float(war_news_score),
+            "macro_event_risk_score": float(macro_event_risk_score),
+            "market_panic_score": float(market_panic_score),
+            "panic_regime": bool(panic_regime),
+            "note": risk_control_note,
+        },
     }

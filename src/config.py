@@ -36,6 +36,11 @@ class Settings:
     torch_epochs: int | None = None
     torch_batch_size: int | None = None
     max_train_rows: int | None = None
+    promote_min_win_rate_delta: float | None = None
+    promote_min_total_return_delta: float | None = None
+    promote_max_drawdown_increase: float | None = None
+    promote_min_profit_factor_delta: float | None = None
+    promote_min_trades: int | None = None
 
     def __post_init__(self) -> None:
         self.symbol = self.symbol or os.getenv("SYMBOL", "BTCUSDT")
@@ -68,6 +73,31 @@ class Settings:
         self.torch_batch_size = int(self.torch_batch_size or os.getenv("TORCH_BATCH_SIZE", "4096"))
         # 0 means use all rows. Set a positive number to speed up retraining.
         self.max_train_rows = int(self.max_train_rows if self.max_train_rows is not None else os.getenv("MAX_TRAIN_ROWS", "40000"))
+        self.promote_min_win_rate_delta = float(
+            self.promote_min_win_rate_delta
+            if self.promote_min_win_rate_delta is not None
+            else os.getenv("MODEL_PROMOTE_MIN_WIN_RATE_DELTA", "0.01")
+        )
+        self.promote_min_total_return_delta = float(
+            self.promote_min_total_return_delta
+            if self.promote_min_total_return_delta is not None
+            else os.getenv("MODEL_PROMOTE_MIN_TOTAL_RETURN_DELTA", "0.0")
+        )
+        self.promote_max_drawdown_increase = float(
+            self.promote_max_drawdown_increase
+            if self.promote_max_drawdown_increase is not None
+            else os.getenv("MODEL_PROMOTE_MAX_DRAWDOWN_INCREASE", "0.02")
+        )
+        self.promote_min_profit_factor_delta = float(
+            self.promote_min_profit_factor_delta
+            if self.promote_min_profit_factor_delta is not None
+            else os.getenv("MODEL_PROMOTE_MIN_PROFIT_FACTOR_DELTA", "0.0")
+        )
+        self.promote_min_trades = int(
+            self.promote_min_trades
+            if self.promote_min_trades is not None
+            else os.getenv("MODEL_PROMOTE_MIN_TRADES", "20")
+        )
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)

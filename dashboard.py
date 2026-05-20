@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import importlib.util
+import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-import sys
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,6 +15,8 @@ from plotly.subplots import make_subplots
 from src.pipeline import run_pipeline, run_quick_update
 from src.snr import compute_snr_levels, merge_multitimeframe_levels
 from src.paper_trade_okx import execute_latest_signal_okx
+from src.trade_journal import append_okx_order_record, load_okx_order_history
+from src.macro_events import generate_estimated_macro_events
 
 INTERVAL_TO_SECONDS = {
     "5m": 5 * 60,
@@ -175,19 +177,124 @@ def _ai_classify_style(row: pd.Series) -> tuple[str, str, float]:
         return "中立 ⚖️", "中立 ⚖️", score
 
 
+def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
+    p_long = float(row.get("p_long", 0.33) or 0.33)
+    p_short = float(row.get("p_short", 0.33) or 0.33)
+    p_flat = float(row.get("p_flat", 0.34) or 0.34)
+    macd_hist = float(row.get("macd_hist", 0.0) or 0.0)
+    rsi = float(row.get("rsi_14", 50.0) or 50.0)
+    fear_greed = float(row.get("fear_greed_value", 50.0) or 50.0)
+    vol24 = float(row.get("realized_vol_24", 0.03) or 0.03)
+    atr_pct = float(row.get("atr_pct", 0.015) or 0.015)
+    drawdown = float(row.get("drawdown", 0.0) or 0.0)
+
+    bull: list[str] = []
+    bear: list[str] = []
+
+    if p_long > p_short:
+        bull.append(f"看漲機率高於看跌（{p_long*100:.1f}% > {p_short*100:.1f}%）。")
+    elif p_short > p_long:
+        bear.append(f"看跌機率高於看漲（{p_short*100:.1f}% > {p_long*100:.1f}%）。")
+    if p_flat >= 0.45:
+        bear.append(f"觀望機率偏高（{p_flat*100:.1f}%），代表市場方向不明。")
+
+    if macd_hist > 0:
+        bull.append("MACD 柱體為正，動能偏多。")
+    elif macd_hist < 0:
+        bear.append("MACD 柱體為負，動能偏空。")
+
+    if rsi <= 35:
+        bull.append(f"RSI 偏低（{rsi:.1f}），存在反彈機會。")
+    elif rsi >= 65:
+        bear.append(f"RSI 偏高（{rsi:.1f}），短線回落風險上升。")
+
+    if fear_greed >= 70:
+        bull.append(f"恐懼貪婪指數偏高（{fear_greed:.0f}），市場情緒偏多。")
+    elif fear_greed <= 30:
+        bear.append(f"恐懼貪婪指數偏低（{fear_greed:.0f}），風險偏好不足。")
+
+    if vol24 > 0.05 or atr_pct > 0.02:
+        bear.append("波動率偏高，假突破與回撤風險增加。")
+    elif vol24 < 0.025 and atr_pct < 0.012:
+        bull.append("波動率相對可控，趨勢延續機率較佳。")
+
+    if drawdown <= -0.10:
+        bear.append("近期回撤偏深，模型風控會傾向保守。")
+
+    if not bull:
+        bull.append("目前偏多依據不足，需等待更明確的突破訊號。")
+    if not bear:
+        bear.append("目前偏空依據不足，空方動能尚未明顯擴大。")
+
+    return bull[:4], bear[:4]
+
+
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
+UI_PREFS_PATH = OUTPUT_DIR / "dashboard_user_prefs.json"
+BALANCE_AUTO_REFRESH_SEC = 30
 預設交易對 = "BTCUSDT"
+多週期清單 = ["5m", "15m", "30m", "1h", "1d"]
+每週期K線上限 = 5000
 
-st.set_page_config(page_title="BTC AI 智能交易儀表板", layout="wide", page_icon="🤖")
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _read_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+st.set_page_config(
+    page_title="BTC AI 智能交易儀表板",
+    layout="wide",
+    page_icon="🤖",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown(
     """
     <style>
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-      * { font-family: 'Inter', sans-serif !important; }
+      @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:FILL@0;wght@400;GRAD@0;opsz@24');
+      @import url('https://fonts.googleapis.com/icon?family=Material+Icons');
+      .stApp, .stApp * {
+        font-family: 'Inter', sans-serif !important;
+      }
+      /* Keep Streamlit/Material icons from being replaced by Inter text glyphs */
+      [data-testid="stIconMaterial"],
+      .material-icons,
+      .material-icons-outlined,
+      .material-icons-round,
+      .material-icons-sharp,
+      .material-icons-two-tone,
+      .material-symbols-outlined,
+      .material-symbols-rounded,
+      .material-symbols-sharp,
+      [class^="material-symbols"],
+      [class*=" material-symbols"] {
+        font-family: "Material Symbols Rounded", "Material Symbols Outlined", "Material Symbols Sharp", "Material Icons" !important;
+        font-style: normal !important;
+        font-weight: 400 !important;
+        line-height: 1 !important;
+        text-transform: none !important;
+        letter-spacing: normal !important;
+        -webkit-font-smoothing: antialiased !important;
+        font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24 !important;
+      }
       .stApp {
         background: radial-gradient(ellipse at 15% 0%, #0f1729 0%, #020810 55%, #0a0f1e 100%);
         color: #f0f4ff;
@@ -232,6 +339,11 @@ st.markdown(
       /* Confidence bar */
       .conf-bar-bg { background:#1e293b; border-radius:999px; height:8px; }
       .conf-bar-fill { border-radius:999px; height:8px; }
+
+      /* Keep cursor style unchanged over Plotly charts */
+      .js-plotly-plot, .js-plotly-plot * {
+        cursor: default !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -321,6 +433,13 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
             decreasing_line_color="#fca5a5",
             increasing_fillcolor="#166534",
             decreasing_fillcolor="#7f1d1d",
+            hovertemplate=(
+                "時間: %{x|%Y-%m-%d %H:%M:%S}<br>"
+                "開: %{open:,.2f}<br>"
+                "高: %{high:,.2f}<br>"
+                "低: %{low:,.2f}<br>"
+                "收: %{close:,.2f}<extra></extra>"
+            ),
         )
     )
 
@@ -370,6 +489,9 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
         plot_bgcolor="rgba(0,0,0,0)",
         legend=dict(orientation="h", y=1.02, x=0),
         uirevision="kline-static",
+        hovermode="x unified",
+        hoverdistance=120,
+        spikedistance=1000,
     )
     fig.update_yaxes(
         title="價格 (USDT)",
@@ -377,7 +499,14 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
         autorange=False,
         gridcolor="#1e293b",
     )
-    fig.update_xaxes(gridcolor="#1e293b")
+    fig.update_xaxes(
+        gridcolor="#1e293b",
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikethickness=1,
+        spikecolor="#64748b",
+    )
     return fig
 
 
@@ -518,9 +647,59 @@ def 事件清單(row: pd.Series) -> list[str]:
         items.append("黑天鵝風險事件")
     if int(取得數值(row, "news_shock", 0)) == 1:
         items.append("新聞衝擊事件")
+    if 取得數值(row, "fed_news_score") > 0:
+        items.append("美聯儲/FOMC 相關新聞")
+    if 取得數值(row, "trump_news_score") > 0:
+        items.append("川普相關新聞")
+    if 取得數值(row, "war_news_score") > 0:
+        items.append("戰爭/地緣衝突風險新聞")
+    if 取得數值(row, "panic_news_score") > 0:
+        items.append("金融市場恐慌訊號")
+    if 取得數值(row, "macro_event_risk_score") > 0:
+        items.append("CPI/PPI/FOMC 公布時段（風險降槓桿）")
     if not items:
         items.append("目前無明顯事件訊號")
     return items
+
+
+def _build_past_event_table(signals_df: pd.DataFrame, max_rows: int = 40) -> pd.DataFrame:
+    if signals_df.empty:
+        return pd.DataFrame(columns=["時間(台北)", "事件", "風險分數"])
+    s = signals_df.copy().sort_values("timestamp")
+    def _num_col(df: pd.DataFrame, name: str) -> pd.Series:
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").fillna(0)
+        return pd.Series(0.0, index=df.index, dtype="float64")
+    mask = (
+        (_num_col(s, "war_news_score") > 0)
+        | (_num_col(s, "panic_news_score") > 0)
+        | (_num_col(s, "fed_news_score") > 0)
+        | (_num_col(s, "trump_news_score") > 0)
+        | (_num_col(s, "macro_event_risk_score") > 0)
+        | (_num_col(s, "black_swan_risk_score") > 0)
+    )
+    e = s[mask].tail(max_rows).copy()
+    if e.empty:
+        return pd.DataFrame(columns=["時間(台北)", "事件", "風險分數"])
+    out = pd.DataFrame()
+    out["時間(台北)"] = pd.to_datetime(e["timestamp"], utc=True).dt.tz_convert("Asia/Taipei").dt.strftime("%Y-%m-%d %H:%M")
+    out["事件"] = e.apply(lambda r: "、".join(事件清單(r)), axis=1)
+    out["風險分數"] = pd.to_numeric(e.get("market_panic_score", 0), errors="coerce").fillna(0).round(2)
+    return out.sort_values("時間(台北)", ascending=False).reset_index(drop=True)
+
+
+def _build_future_event_table(now_utc: pd.Timestamp, days: int = 120) -> pd.DataFrame:
+    start = pd.to_datetime(now_utc, utc=True)
+    end = start + pd.Timedelta(days=days)
+    ev = generate_estimated_macro_events(start, end)
+    if ev.empty:
+        return pd.DataFrame(columns=["時間(台北)", "事件", "類型", "風險權重"])
+    out = pd.DataFrame()
+    out["時間(台北)"] = pd.to_datetime(ev["timestamp"], utc=True).dt.tz_convert("Asia/Taipei").dt.strftime("%Y-%m-%d %H:%M")
+    out["事件"] = ev["event_name"].astype(str)
+    out["類型"] = ev["event_type"].astype(str)
+    out["風險權重"] = pd.to_numeric(ev["risk_weight"], errors="coerce").fillna(0).round(2)
+    return out.reset_index(drop=True)
 
 
 def 同步槓桿設定(prefix: str, label: str, default: int, min_value: int = 1, max_value: int = 100) -> int:
@@ -712,23 +891,67 @@ def _嘗試載入週期資料(symbol: str, interval: str) -> pd.DataFrame | None
 
 # ═══════════════════ SIDEBAR ═══════════════════════════════════════════════
 st.sidebar.markdown("## ⚙️ 設定")
-交易對 = st.sidebar.text_input("交易對", value=預設交易對)
-週期 = st.sidebar.selectbox("K線週期", ["5m", "15m", "30m", "1h", "1d"], index=3)
+_ui_prefs = _read_json_file(UI_PREFS_PATH)
+
+def _pref_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        v = int(_ui_prefs.get(name, default))
+    except Exception:
+        v = int(default)
+    if min_value is not None:
+        v = max(int(min_value), v)
+    if max_value is not None:
+        v = min(int(max_value), v)
+    return v
+
+
+def _pref_float(name: str, default: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    try:
+        v = float(_ui_prefs.get(name, default))
+    except Exception:
+        v = float(default)
+    if min_value is not None:
+        v = max(float(min_value), v)
+    if max_value is not None:
+        v = min(float(max_value), v)
+    return v
+
+
+# Restore last-used UI controls once per new session.
+if not bool(st.session_state.get("_ui_prefs_loaded_once", False)):
+    st.session_state["ui_symbol"] = str(_ui_prefs.get("symbol", 預設交易對))
+    st.session_state["ui_interval"] = str(_ui_prefs.get("kline_interval", "1h"))
+    st.session_state["ui_kline_count"] = _pref_int("kline_count", 300, min_value=100, max_value=2000)
+    st.session_state["ui_kline_auto_update_enabled"] = bool(_ui_prefs.get("kline_auto_update_enabled", False))
+    st.session_state["ui_kline_auto_update_sec"] = _pref_int("kline_auto_update_sec", 15, min_value=5, max_value=3600)
+    st.session_state["ui_max_train_rows"] = _pref_int("max_train_rows", 40000, min_value=0, max_value=2000000)
+    st.session_state["ui_black_swan_reserve_usdt"] = _pref_float("black_swan_reserve_usdt", 0.0, min_value=0.0, max_value=10_000_000.0)
+    st.session_state["ui_black_swan_threshold"] = _pref_float("black_swan_threshold", 1.0, min_value=0.0, max_value=10.0)
+    st.session_state["_ui_prefs_loaded_once"] = True
+
+交易對 = st.sidebar.text_input("交易對", value=st.session_state["ui_symbol"], key="ui_symbol")
+if str(st.session_state.get("ui_interval", "1h")) not in 多週期清單:
+    st.session_state["ui_interval"] = "1h"
+週期 = st.sidebar.selectbox("K線週期", 多週期清單, key="ui_interval")
 if "_last_interval_selected" not in st.session_state:
     st.session_state["_last_interval_selected"] = 週期
 if st.session_state["_last_interval_selected"] != 週期:
     st.session_state["_last_interval_selected"] = 週期
     st.session_state["_sync_after_interval_switch"] = True
 槓桿上限 = 同步槓桿設定("槓桿上限", "槓桿上限 (1~100)", default=100)
-K線根數 = st.sidebar.slider("K線顯示根數", min_value=100, max_value=2000, value=300, step=50)
+K線根數 = st.sidebar.slider("K線顯示根數", min_value=100, max_value=2000, step=50, key="ui_kline_count")
 
 st.sidebar.divider()
 st.sidebar.markdown("### 🎯 風險偏好")
 st.sidebar.caption("AI 自動判斷市場風格（激進/中立/保守）；此選項只作為槓桿倍率的偏好係數。")
+if "risk_profile" not in st.session_state:
+    _saved_risk = str(_ui_prefs.get("risk_profile", "中立 ⚖️"))
+    if _saved_risk not in RISK_PROFILES:
+        _saved_risk = list(RISK_PROFILES.keys())[1]
+    st.session_state["risk_profile"] = _saved_risk
 風險偏好 = st.sidebar.radio(
     "槓桿偏好",
     options=list(RISK_PROFILES.keys()),
-    index=1,
     label_visibility="collapsed",
     key="risk_profile",
 )
@@ -749,39 +972,29 @@ tag = f"{交易對}_{週期}"
 
 st.sidebar.divider()
 st.sidebar.markdown("### 🔄 資料更新")
-按鈕全量 = st.sidebar.button("重新抓取 BTCUSDT 全歷史", use_container_width=True)
-按鈕快速 = st.sidebar.button("快速更新", use_container_width=True)
-按鈕增量重訓 = st.sidebar.button("增量更新+重訓回測", use_container_width=True)
-即時更新啟用 = st.sidebar.checkbox("K線即時更新", value=False,
-                                     help="開啟後會定時做『快速更新』並自動刷新頁面。")
-即時更新秒數 = st.sidebar.number_input("K線即時更新秒數", min_value=5, max_value=3600, value=15, step=1)
-訓練最大樣本數 = st.sidebar.number_input("重訓最大樣本數 (0=全量)", min_value=0, max_value=2000000,
-                                           value=40000, step=10000)
-if st.sidebar.button("環境自檢", use_container_width=True):
-    spec_torch = importlib.util.find_spec("torch")
-    spec_dml = importlib.util.find_spec("torch_directml")
-    env_info = {
-        "python_executable": sys.executable,
-        "python_version": sys.version.replace("\n", " "),
-        "cwd": str(Path.cwd()),
-        "venv311_exists": (BASE_DIR / ".venv311" / "Scripts" / "python.exe").exists(),
-        "venv_exists": (BASE_DIR / ".venv" / "Scripts" / "python.exe").exists(),
-        "torch_installed": bool(spec_torch),
-        "torch_directml_installed": bool(spec_dml),
-    }
-    if spec_torch:
-        try:
-            import torch  # type: ignore
-            env_info["torch_version"] = str(torch.__version__)
-        except Exception as e:
-            env_info["torch_version_error"] = str(e)
-    if spec_dml:
-        try:
-            import torch_directml  # type: ignore
-            env_info["torch_directml_device"] = str(torch_directml.device())
-        except Exception as e:
-            env_info["torch_directml_error"] = str(e)
-    st.sidebar.json(env_info)
+st.sidebar.caption("全週期執行（5m/15m/30m/1h/1d），每週期只保留最新 5000 根 K 線。")
+按鈕全量 = st.sidebar.button("全部週期抓資料+訓練", use_container_width=True)
+按鈕快速 = st.sidebar.button("全部週期快速更新", use_container_width=True)
+按鈕增量重訓 = st.sidebar.button("全部週期增量重訓", use_container_width=True)
+即時更新啟用 = st.sidebar.checkbox(
+    "K線即時更新",
+    key="ui_kline_auto_update_enabled",
+    help="開啟後會定時做『快速更新』並自動刷新頁面。",
+)
+即時更新秒數 = st.sidebar.number_input(
+    "K線即時更新秒數",
+    min_value=5,
+    max_value=3600,
+    step=1,
+    key="ui_kline_auto_update_sec",
+)
+訓練最大樣本數 = st.sidebar.number_input(
+    "重訓最大樣本數 (0=全量)",
+    min_value=0,
+    max_value=2000000,
+    step=10000,
+    key="ui_max_train_rows",
+)
 
 st.sidebar.divider()
 st.sidebar.markdown("### 🧑‍🏫 知識蒸餾 (Teacher)")
@@ -809,21 +1022,100 @@ if _teacher_ok:
 else:
     st.sidebar.info("尚未訓練 Teacher，點擊上方按鈕開始。")
 okx_inst = st.sidebar.text_input("OKX 合約 instId", value="BTC-USDT-SWAP")
-okx_notional = st.sidebar.number_input("下單名目(USDT)", min_value=5.0, max_value=100000.0,
+okx_notional = st.sidebar.number_input("下單本金(USDT)", min_value=5.0, max_value=100000.0,
                                          value=50.0, step=5.0)
 okx_enable = st.sidebar.checkbox("允許送出模擬盤下單(OKX_ENABLE_TRADING=1)", value=False)
 okx_sync_before_order = st.sidebar.checkbox("下單前先快速同步資料", value=False)
-自動交易啟用 = st.sidebar.checkbox("啟用純AI自動交易", value=False,
-                                     help="開啟後定時用最新AI訊號自動下單。")
-自動交易秒數 = st.sidebar.number_input("自動交易檢查秒數", min_value=10, max_value=3600, value=30, step=5)
-自動止盈百分比 = st.sidebar.number_input("自動止盈(%)", min_value=0.1, max_value=50.0, value=1.5, step=0.1)
-自動止損百分比 = st.sidebar.number_input("自動止損(%)", min_value=0.1, max_value=50.0, value=1.0, step=0.1)
+if "ui_black_swan_reserve_usdt" not in st.session_state:
+    st.session_state["ui_black_swan_reserve_usdt"] = _pref_float("black_swan_reserve_usdt", 0.0, min_value=0.0, max_value=10_000_000.0)
+if "ui_black_swan_threshold" not in st.session_state:
+    st.session_state["ui_black_swan_threshold"] = _pref_float("black_swan_threshold", 1.0, min_value=0.0, max_value=10.0)
+黑天鵝保留資金 = float(st.session_state.get("ui_black_swan_reserve_usdt", 0.0))
+黑天鵝觸發門檻 = float(st.session_state.get("ui_black_swan_threshold", 1.0))
 
 
-def _run_okx(action: str) -> None:
+# ── 帳戶餘額即時查詢（供頂部 banner 顯示） ────────────────────────
+_bal_cache_key = "okx_balance_cache"
+_bal_last_fetch_key = "okx_balance_last_fetch_ts"
+
+def _fetch_and_show_balance() -> None:
+    import os as _os
+    _os.environ.setdefault("OKX_SIMULATED", "1")
+    try:
+        from src.exchange_okx import OKXClient, OKXCredentials
+        _creds = OKXCredentials(
+            api_key=_os.getenv("OKX_API_KEY", ""),
+            secret_key=_os.getenv("OKX_API_SECRET", ""),
+            passphrase=_os.getenv("OKX_API_PASSPHRASE", ""),
+        )
+        _cli = OKXClient(creds=_creds, simulated=True)
+        _resp = _cli.get_balance("USDT")
+        _details = (_resp.get("data") or [{}])[0].get("details") or []
+        _usdt = next(
+            (float(d.get("eq") or d.get("availBal") or 0)
+             for d in _details if d.get("ccy") == "USDT"),
+            None,
+        )
+        if _usdt is None:
+            _total = str((_resp.get("data") or [{}])[0].get("totalEq") or "N/A")
+            st.session_state[_bal_cache_key] = {"usdt": None, "totalEq": _total, "fetched_at_utc": _utc_now_iso()}
+        else:
+            st.session_state[_bal_cache_key] = {"usdt": _usdt, "totalEq": None, "fetched_at_utc": _utc_now_iso()}
+        st.session_state[_bal_last_fetch_key] = time.time()
+    except Exception as _be:
+        st.session_state[_bal_cache_key] = {"error": str(_be), "fetched_at_utc": _utc_now_iso()}
+        st.session_state[_bal_last_fetch_key] = time.time()
+
+_last_bal_ts = float(st.session_state.get(_bal_last_fetch_key, 0.0))
+if (time.time() - _last_bal_ts) >= BALANCE_AUTO_REFRESH_SEC:
+    _fetch_and_show_balance()
+
+_bal_data = st.session_state.get(_bal_cache_key, {})
+
+
+if "ui_auto_trade_enabled" not in st.session_state:
+    st.session_state["ui_auto_trade_enabled"] = bool(_ui_prefs.get("auto_trade_enabled", False))
+if "ui_auto_trade_sec" not in st.session_state:
+    st.session_state["ui_auto_trade_sec"] = int(_ui_prefs.get("auto_trade_sec", 30))
+if "ui_tp_pct" not in st.session_state:
+    st.session_state["ui_tp_pct"] = float(_ui_prefs.get("tp_pct", 1.5))
+if "ui_sl_pct" not in st.session_state:
+    st.session_state["ui_sl_pct"] = float(_ui_prefs.get("sl_pct", 1.0))
+st.sidebar.markdown("### ⚡ 純AI自動交易")
+st.sidebar.caption("純AI：只在目前這個 dashboard 頁面運行，關頁或斷線會停止。")
+自動交易啟用 = st.sidebar.checkbox("啟用純AI自動交易", key="ui_auto_trade_enabled",
+                                     help="開啟後會定時使用最新版AI訊號自動下單。")
+自動交易秒數 = st.sidebar.number_input("自動交易檢查秒數", min_value=10, max_value=3600, step=5, key="ui_auto_trade_sec")
+自動止盈百分比 = st.sidebar.number_input("自動止盈(%)", min_value=0.1, max_value=50.0, step=0.1, key="ui_tp_pct")
+自動止損百分比 = st.sidebar.number_input("自動止損(%)", min_value=0.1, max_value=50.0, step=0.1, key="ui_sl_pct")
+
+_write_json_file(
+    UI_PREFS_PATH,
+    {
+        "symbol": str(st.session_state.get("ui_symbol", 預設交易對)),
+        "kline_interval": str(st.session_state.get("ui_interval", "1h")),
+        "kline_count": int(st.session_state.get("ui_kline_count", 300)),
+        "kline_auto_update_enabled": bool(st.session_state.get("ui_kline_auto_update_enabled", False)),
+        "kline_auto_update_sec": int(st.session_state.get("ui_kline_auto_update_sec", 15)),
+        "max_train_rows": int(st.session_state.get("ui_max_train_rows", 40000)),
+        "risk_profile": str(st.session_state.get("risk_profile", "中立 ⚖️")),
+        "auto_trade_enabled": bool(st.session_state.get("ui_auto_trade_enabled", False)),
+        "auto_trade_sec": int(st.session_state.get("ui_auto_trade_sec", 30)),
+        "tp_pct": float(st.session_state.get("ui_tp_pct", 1.5)),
+        "sl_pct": float(st.session_state.get("ui_sl_pct", 1.0)),
+        "black_swan_reserve_usdt": float(st.session_state.get("ui_black_swan_reserve_usdt", 0.0)),
+        "black_swan_threshold": float(st.session_state.get("ui_black_swan_threshold", 1.0)),
+        "updated_at_utc": _utc_now_iso(),
+    },
+)
+
+def _run_okx(action: str) -> dict | None:
     import os
+
     os.environ["OKX_INST_ID"] = okx_inst
     os.environ["OKX_NOTIONAL_USDT"] = str(float(okx_notional))
+    os.environ["OKX_BLACK_SWAN_RESERVE_USDT"] = str(float(黑天鵝保留資金))
+    os.environ["OKX_BLACK_SWAN_THRESHOLD"] = str(float(黑天鵝觸發門檻))
     os.environ["OKX_ENABLE_TRADING"] = "1" if okx_enable else "0"
     os.environ["OKX_SIMULATED"] = "1"
     os.environ["OKX_MAX_LEVERAGE"] = "100"
@@ -831,13 +1123,39 @@ def _run_okx(action: str) -> None:
         try:
             if okx_sync_before_order:
                 try:
+                    os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
                     run_quick_update(symbol=交易對, interval=週期)
                 except Exception as e:
                     st.sidebar.warning(f"資料快速更新失敗：{e}")
             trade_res = execute_latest_signal_okx(OUTPUT_DIR, 交易對, 週期,
                                                    leverage_override=0, action_override=action)
-            st.sidebar.success(f"OKX 完成：{trade_res.get('action')} ({action})")
+            _act_msg = str(trade_res.get("action", ""))
+            if _act_msg == "HOLD":
+                _note = str((trade_res.get("risk_controls", {}) or {}).get("note", "")).strip()
+                if _note:
+                    st.sidebar.info(f"OKX HOLD（{action}）：{_note}")
+                else:
+                    st.sidebar.info(f"OKX HOLD（{action}）")
+            else:
+                st.sidebar.success(f"OKX 完成：{_act_msg} ({action})")
             st.session_state["okx_last"] = trade_res
+            append_okx_order_record(
+                outputs_dir=OUTPUT_DIR,
+                source="dashboard_manual" if action in {"LONG", "SHORT", "CLOSE"} else "dashboard_auto",
+                symbol=str(交易對),
+                interval=str(週期),
+                trade_res=trade_res,
+                control_payload={
+                    "mode": "pure_ai",
+                    "okx_inst_id": str(okx_inst),
+                    "okx_notional_usdt": float(okx_notional),
+                    "okx_black_swan_reserve_usdt": float(st.session_state.get("ui_black_swan_reserve_usdt", 0.0)),
+                    "okx_black_swan_threshold": float(st.session_state.get("ui_black_swan_threshold", 1.0)),
+                    "okx_enable_trading": bool(okx_enable),
+                    "okx_simulated": True,
+                    "okx_max_leverage": 100,
+                },
+            )
             act = str(trade_res.get("action", ""))
             px = float(trade_res.get("price", 0.0) or 0.0)
             if act == "OPEN_LONG":
@@ -852,53 +1170,80 @@ def _run_okx(action: str) -> None:
                 }
             elif act == "CLOSE":
                 st.session_state["auto_pos_state"] = None
+            return trade_res
         except Exception as e:
             st.sidebar.error(f"OKX 失敗：{e}")
+            return None
 
 
 # ── 按鈕動作 ────────────────────────────────────────────────────────────────
-if 按鈕全量:
-    import os
+def _prepare_data_train_env() -> int:
     os.environ["TRAIN_DEVICE"] = "cloud"
     os.environ["NPU_STRICT"] = "0"
-    os.environ["MAX_TRAIN_ROWS"] = str(int(訓練最大樣本數))
-    with st.spinner("全歷史重抓 + 訓練回測中，請稍候..."):
-        try:
-            run_pipeline(force_full_refresh=True, symbol=交易對, interval=週期)
-            st.success("全歷史更新完成")
-        except Exception as e:
-            st.error(f"訓練失敗：{e}")
+    os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
+    _user_limit = int(訓練最大樣本數)
+    _effective_train_rows = int(每週期K線上限 if _user_limit <= 0 else min(_user_limit, 每週期K線上限))
+    os.environ["MAX_TRAIN_ROWS"] = str(_effective_train_rows)
+    return _effective_train_rows
+
+
+if 按鈕全量:
+    _train_cap = _prepare_data_train_env()
+    with st.spinner("正在更新全部週期資料並訓練（每週期最新 5000 根）..."):
+        _failed: list[str] = []
+        for _tf in 多週期清單:
+            try:
+                run_pipeline(force_full_refresh=True, symbol=交易對, interval=_tf)
+            except Exception as e:
+                _failed.append(f"{_tf}: {e}")
+    if _failed:
+        st.error("部分週期失敗：" + " | ".join(_failed))
+    else:
+        st.success(f"全部週期完成（{', '.join(多週期清單)}），每週期訓練筆數上限：{_train_cap}")
 
 if 按鈕快速:
-    with st.spinner("快速更新中（只做尾段增量回補，不重訓）..."):
-        快速成功 = True
-        try:
-            run_quick_update(symbol=交易對, interval=週期)
-        except FileNotFoundError:
-            快速成功 = False
-            st.error("找不到該週期已訓練模型，請先執行一次『增量更新+重訓回測』或『全歷史重抓』。")
-    if 快速成功:
-        st.success("快速更新完成")
+    _prepare_data_train_env()
+    with st.spinner("快速更新全部週期中（只更新最新資料，不重訓）..."):
+        _failed: list[str] = []
+        for _tf in 多週期清單:
+            try:
+                run_quick_update(symbol=交易對, interval=_tf)
+            except FileNotFoundError:
+                _failed.append(f"{_tf}: 尚未有模型")
+            except Exception as e:
+                _failed.append(f"{_tf}: {e}")
+    if _failed:
+        st.warning("快速更新完成，但部分週期未成功：" + " | ".join(_failed))
+    else:
+        st.success(f"快速更新完成（{', '.join(多週期清單)}）")
 
 if 按鈕增量重訓:
-    import os
-    os.environ["TRAIN_DEVICE"] = "cloud"
-    os.environ["NPU_STRICT"] = "0"
-    os.environ["MAX_TRAIN_ROWS"] = str(int(訓練最大樣本數))
+    _train_cap = _prepare_data_train_env()
     進度文字 = st.empty()
     進度條 = st.progress(0, text="準備開始...")
 
-    def 回報進度(p: int, msg: str) -> None:
-        p = max(0, min(100, int(p)))
-        進度條.progress(p, text=f"{msg} ({p}%)")
-        進度文字.info(f"目前進度：{msg}")
+    _failed: list[str] = []
+    _total = len(多週期清單)
+    for _idx, _tf in enumerate(多週期清單):
+        _base = (_idx * 100.0) / max(1, _total)
+        _span = 100.0 / max(1, _total)
 
-    try:
-        run_pipeline(force_full_refresh=False, progress_cb=回報進度, symbol=交易對, interval=週期)
-        進度條.progress(100, text="全部完成 (100%)")
-        st.success("增量更新 + 重訓回測完成")
-    except Exception as e:
-        st.error(f"訓練失敗：{e}")
+        def 回報進度(p: int, msg: str, _tf_in: str = _tf, _base_in: float = _base, _span_in: float = _span) -> None:
+            p = max(0, min(100, int(p)))
+            overall = int(min(99, _base_in + (_span_in * p / 100.0)))
+            進度條.progress(overall, text=f"[{_tf_in}] {msg} ({overall}%)")
+            進度文字.info(f"目前進度：[{_tf_in}] {msg}")
+
+        try:
+            run_pipeline(force_full_refresh=False, progress_cb=回報進度, symbol=交易對, interval=_tf)
+        except Exception as e:
+            _failed.append(f"{_tf}: {e}")
+
+    進度條.progress(100, text="全部完成 (100%)")
+    if _failed:
+        st.error("部分週期訓練失敗：" + " | ".join(_failed))
+    else:
+        st.success(f"增量更新 + 重訓回測完成（全部週期），每週期訓練筆數上限：{_train_cap}")
 
 # ── Teacher 蒸餾訓練 ──────────────────────────────────────────────────
 if 按鈕訓練Teacher:
@@ -944,6 +1289,7 @@ if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全
     with st.sidebar:
         with st.spinner("已切換週期，正在同步..."):
             try:
+                os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
                 run_quick_update(symbol=交易對, interval=週期)
                 st.success("週期切換同步完成")
             except FileNotFoundError:
@@ -957,6 +1303,7 @@ if 即時更新啟用:
     上次更新 = float(st.session_state.get("kline_auto_last_update_ts", 0.0))
     if (目前時間 - 上次更新) >= int(即時更新秒數):
         try:
+            os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
             run_quick_update(symbol=交易對, interval=週期)
             st.session_state["kline_auto_last_update_ts"] = 目前時間
             st.session_state["kline_auto_last_msg"] = f"K線即時更新成功：{time.strftime('%H:%M:%S')}"
@@ -990,6 +1337,31 @@ if signals.empty:
 if "okx_last" in st.session_state:
     with st.expander("OKX 模擬盤下單回應"):
         st.json(st.session_state["okx_last"])
+
+with st.expander("OKX 歷史紀錄", expanded=False):
+    _okx_hist = load_okx_order_history(OUTPUT_DIR)
+    if _okx_hist.empty:
+        st.caption("尚無 OKX 歷史紀錄。")
+    else:
+        _show_cols = [
+            c
+            for c in [
+                "logged_at_utc",
+                "source",
+                "symbol",
+                "interval",
+                "decision_timestamp",
+                "signal",
+                "action",
+                "price",
+                "leverage",
+                "size",
+                "enable_trading",
+                "inst_id",
+            ]
+            if c in _okx_hist.columns
+        ]
+        st.dataframe(_okx_hist.sort_values("logged_at_utc", ascending=False)[_show_cols].head(200), use_container_width=True)
 
 最新 = signals.iloc[-1]
 價格 = 取得數值(最新, "close")
@@ -1043,16 +1415,24 @@ if 自動交易啟用:
             if tp_hit:
                 st.sidebar.success("觸發自動止盈，執行平倉。")
                 _run_okx("CLOSE")
+                st.session_state["auto_pos_state"] = None
+                st.session_state["auto_trade_last_msg"] = f"止盈出場 (TP {float(自動止盈百分比):.1f}%) 入場:{entry:,.2f}"
             elif sl_hit:
                 st.sidebar.error("觸發自動止損，執行平倉。")
                 _run_okx("CLOSE")
+                st.session_state["auto_pos_state"] = None
+                st.session_state["auto_trade_last_msg"] = f"止損出場 (SL {float(自動止損百分比):.1f}%) 入場:{entry:,.2f}"
 
         上次訊號簽名 = str(st.session_state.get("auto_trade_last_signal_sig", ""))
         目前訊號簽名 = f"{最新['timestamp']}|{int(取得數值(最新,'signal',0))}|{float(取得數值(最新,'suggested_leverage',1.0)):.2f}"
         if 目前訊號簽名 != 上次訊號簽名 and not st.session_state.get("auto_pos_state"):
-            _run_okx("AUTO")
+            _auto_res = _run_okx("AUTO")
             st.session_state["auto_trade_last_signal_sig"] = 目前訊號簽名
-            st.session_state["auto_trade_last_msg"] = f"純AI自動交易已執行（新訊號）：{最新['timestamp']}"
+            _risk = (_auto_res or {}).get("risk_controls", {}) if isinstance(_auto_res, dict) else {}
+            if bool(_risk.get("hold_due_to_black_swan", False)):
+                st.session_state["auto_trade_last_msg"] = "黑天鵝風險啟動：自動交易暫停，請手動操作倉位。"
+            else:
+                st.session_state["auto_trade_last_msg"] = f"純AI自動交易已執行（新訊號）：{最新['timestamp']}"
         if st.session_state.get("auto_trade_last_msg"):
             st.sidebar.caption(str(st.session_state["auto_trade_last_msg"]))
 
@@ -1109,8 +1489,18 @@ with col_conf:
 st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
 # ── 頂部指標 ─────────────────────────────────────────────────────────────────
-頂部 = st.columns(4)
+餘額顯示 = "未同步"
+if _bal_data:
+    if _bal_data.get("usdt") is not None:
+        餘額顯示 = f"{float(_bal_data['usdt']):,.2f} USDT"
+    elif _bal_data.get("totalEq"):
+        餘額顯示 = f"{_bal_data['totalEq']} USDT"
+    elif _bal_data.get("error"):
+        餘額顯示 = "讀取失敗"
+
+頂部 = st.columns([1.45, 1.35, 1.10, 1.10, 1.00])
 metrics = [
+    ("OKX 餘額", 餘額顯示, ""),
     ("最新收盤價", f"{價格:,.2f} USDT", ""),
     ("看漲機率", f"{P看漲 * 100:.2f}%", "signal-bull"),
     ("看跌機率", f"{P看跌 * 100:.2f}%", "signal-bear"),
@@ -1127,11 +1517,47 @@ for col, (title, val, cls) in zip(頂部, metrics):
             unsafe_allow_html=True,
         )
 
+控制列 = st.columns([1.35, 1.15])
+with 控制列[0]:
+    st.markdown("""<div class="metric-card"><div class="metric-title">黑天鵝緩衝金 (USDT)</div></div>""", unsafe_allow_html=True)
+    st.number_input(
+        "黑天鵝緩衝金 (USDT)",
+        min_value=0.0,
+        max_value=10_000_000.0,
+        step=10.0,
+        key="ui_black_swan_reserve_usdt",
+        label_visibility="collapsed",
+        help="黑天鵝事件觸發時，純AI自動交易會暫停；此金額視為你保留手動操作的資金。",
+    )
+with 控制列[1]:
+    st.markdown("""<div class="metric-card"><div class="metric-title">黑天鵝觸發門檻（風險分數）</div></div>""", unsafe_allow_html=True)
+    st.number_input(
+        "黑天鵝觸發門檻（風險分數）",
+        min_value=0.0,
+        max_value=10.0,
+        step=0.1,
+        key="ui_black_swan_threshold",
+        label_visibility="collapsed",
+        help="無單位分數（0~10）。當 black_swan_risk_score 超過此值時，自動交易暫停並改為手動操作。",
+    )
+
 st.markdown(
     f'<div class="signal-line" style="margin:12px 0 4px">訊號: <span class="{顏色類}">{訊號}</span>'
     f' &nbsp;|&nbsp; 動作: <span class="{顏色類}">{動作}</span></div>',
     unsafe_allow_html=True,
 )
+
+看漲原因, 看跌原因 = _build_bull_bear_reasons(最新)
+原因左, 原因右 = st.columns(2)
+with 原因左:
+    st.markdown("#### 🟢 看漲原因")
+    for text in 看漲原因:
+        st.markdown(f"- {text}")
+with 原因右:
+    st.markdown("#### 🔴 看跌原因")
+    for text in 看跌原因:
+        st.markdown(f"- {text}")
+
 st.markdown(
     f'<div class="subtle">K線開盤：{最新開盤台北} | K線收盤：{最新收盤台北} | '
     f'模型槓桿：{模型槓桿:.2f}× | 安全槓桿：{安全槓桿:.2f}× | 上限：{槓桿上限}×</div>',
@@ -1175,6 +1601,7 @@ if 顯示SNR:
         lv = compute_snr_levels(src2, timeframe=tf, lookback_bars=800, pivot_window=5, max_levels=int(SNR最大線數))
         all_levels.extend(lv)
     merged = merge_multitimeframe_levels(all_levels, tolerance_abs=float(merge_tol))
+    _x_end = 顯示區["timestamp"].iloc[-1]
     for lv in merged:
         if len(lv.timeframes) < int(SNR重疊層數):
             continue
@@ -1183,12 +1610,32 @@ if 顯示SNR:
                                if x in ["5m", "15m", "30m", "1h", "1d"] else 99))
         kind = "S" if (lv.kinds == {"S"}) else ("R" if (lv.kinds == {"R"}) else "S/R")
         color = "#22c55e" if kind == "S" else ("#ef4444" if kind == "R" else "#a78bfa")
-        fig_k.add_hline(
-            y=float(lv.price), line_dash="solid", line_width=1,
-            line_color=color, opacity=0.75,
-            annotation_text=f"{kind} {tfs}",
-            annotation_position="top right",
-            annotation_font_color=color,
+        _touch = 顯示區[(顯示區["low"] <= float(lv.price)) & (顯示區["high"] >= float(lv.price))]
+        if _touch.empty:
+            continue
+        _x_start = _touch["timestamp"].iloc[0]
+        fig_k.add_shape(
+            type="line",
+            xref="x",
+            yref="y",
+            x0=_x_start,
+            x1=_x_end,
+            y0=float(lv.price),
+            y1=float(lv.price),
+            line=dict(color=color, width=1, dash="solid"),
+            opacity=0.75,
+        )
+        fig_k.add_annotation(
+            x=_x_end,
+            y=float(lv.price),
+            xref="x",
+            yref="y",
+            text=f"{kind} {tfs}",
+            showarrow=False,
+            xanchor="left",
+            xshift=6,
+            font=dict(color=color, size=11),
+            bgcolor="rgba(15,23,42,0.65)",
         )
 
 st.plotly_chart(fig_k, use_container_width=True, config={"scrollZoom": True})
@@ -1219,9 +1666,32 @@ with 分頁[3]:
     st.plotly_chart(ATR圖(顯示區), use_container_width=True)
 
 with 分頁[4]:
-    st.markdown("### 🗞️ 事件清單")
-    for e in 事件清單(最新):
-        st.write(f"• {e}")
+    st.markdown("### 🗞️ 事件清單（左：過去 / 右：未來）")
+    目前風險分數 = 取得數值(最新, "market_panic_score", 0.0)
+    st.caption(
+        f"目前事件風險分數：`{目前風險分數:.2f}`（由戰爭/恐慌新聞、黑天鵝訊號、CPI/PPI/FOMC 時段等特徵組合）"
+    )
+    st.caption("新聞源每小時更新，會特別追蹤『美聯儲 / 川普 / 戰爭 / 恐慌』關鍵字。")
+    if 取得數值(最新, "war_news_score", 0.0) > 0:
+        st.error("偵測到戰爭/地緣衝突新聞，請優先檢查倉位風險。")
+    elif 取得數值(最新, "panic_news_score", 0.0) > 0:
+        st.warning("偵測到市場恐慌訊號，策略會偏向防守或反向避險。")
+
+    左欄, 右欄 = st.columns(2)
+    with 左欄:
+        st.markdown("#### 過去事件")
+        過去事件表 = _build_past_event_table(signals, max_rows=50)
+        if 過去事件表.empty:
+            st.info("最近沒有顯著事件。")
+        else:
+            st.dataframe(過去事件表, use_container_width=True, hide_index=True)
+    with 右欄:
+        st.markdown("#### 未來事件")
+        未來事件表 = _build_future_event_table(pd.Timestamp.utcnow(), days=120)
+        if 未來事件表.empty:
+            st.info("目前沒有未來事件資料。")
+        else:
+            st.dataframe(未來事件表, use_container_width=True, hide_index=True)
 
 with 分頁[5]:
     st.plotly_chart(恐懼貪婪儀表(取得數值(最新, "fear_greed_value", 50.0)), use_container_width=True)
@@ -1380,6 +1850,7 @@ if 即時更新啟用 or 自動交易啟用:
     time.sleep(max(1, refresh_s))
     if _should_run_quick_update_now(signals, 週期):
         try:
+            os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
             run_quick_update(symbol=交易對, interval=週期)
             st.session_state["kline_auto_last_msg"] = f"快速更新成功：{time.strftime('%H:%M:%S')}"
         except Exception as e:
