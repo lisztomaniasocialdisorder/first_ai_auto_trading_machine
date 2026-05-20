@@ -209,7 +209,7 @@ def run_pipeline(
     labeled_full = build_labels(feat, horizon_bars=bars, long_th=settings.long_threshold, short_th=settings.short_threshold)
     labeled_train = labeled_full.dropna().reset_index(drop=True)
     if progress_cb:
-        progress_cb(65, "標籤建構完成，準備開始訓練模型 (可能需要幾分鐘，請耐心等候)...")
+        progress_cb(65, "標籤建構完成，準備開始訓練模型（可能需要幾分鐘）")
 
     # ── 自動偵測 Teacher 軟標籤，若存在則將蒸餾混入訓練 ─────────
     tag = f"{settings.symbol}_{settings.interval}"
@@ -220,7 +220,7 @@ def run_pipeline(
         try:
             soft_labels_df = pd.read_csv(soft_label_path)
             if progress_cb:
-                progress_cb(66, f"偵測到 Teacher 軟標籤（{len(soft_labels_df):,} 筆），開啟蒸餾模式（alpha={distill_alpha}）...")
+                progress_cb(66, f"偵測到 Teacher 軟標籤（{len(soft_labels_df):,} 筆），啟用蒸餾訓練（alpha={distill_alpha}）")
         except Exception as _e:
             import warnings
             warnings.warn(f"[pipeline] 無法載入 Teacher 軟標籤：{_e}，退回純硬標籤訓練。", stacklevel=2)

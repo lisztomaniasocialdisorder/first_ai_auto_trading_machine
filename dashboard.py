@@ -1378,10 +1378,13 @@ if "okx_last" in st.session_state:
         st.json(st.session_state["okx_last"])
 
 with st.expander("OKX 歷史紀錄", expanded=False):
-    _okx_hist = load_okx_order_history(OUTPUT_DIR)
+    _okx_since_tw = pd.Timestamp("2026-05-20 00:00:00", tz="Asia/Taipei")
+    _okx_since_utc = _okx_since_tw.tz_convert("UTC")
+    _okx_hist = load_okx_order_history(OUTPUT_DIR, since_utc=_okx_since_utc)
     if _okx_hist.empty:
-        st.caption("尚無 OKX 歷史紀錄。")
+        st.caption("尚無 OKX 歷史紀錄（目前僅顯示 2026-05-20 起）。")
     else:
+        st.caption("僅顯示 2026-05-20（台北）起的 OKX 下單紀錄。")
         _show_cols = [
             c
             for c in [

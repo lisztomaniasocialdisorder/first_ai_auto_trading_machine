@@ -76,7 +76,7 @@ def append_okx_order_record(
     return path
 
 
-def load_okx_order_history(outputs_dir: Path) -> pd.DataFrame:
+def load_okx_order_history(outputs_dir: Path, since_utc: pd.Timestamp | None = None) -> pd.DataFrame:
     path = outputs_dir / ORDER_HISTORY_FILE
     if not path.exists():
         return pd.DataFrame()
@@ -86,4 +86,8 @@ def load_okx_order_history(outputs_dir: Path) -> pd.DataFrame:
         return pd.DataFrame()
     if "logged_at_utc" in df.columns:
         df["logged_at_utc"] = pd.to_datetime(df["logged_at_utc"], utc=True, errors="coerce")
+        if since_utc is not None:
+            _since = pd.to_datetime(since_utc, utc=True, errors="coerce")
+            if not pd.isna(_since):
+                df = df[df["logged_at_utc"] >= _since].copy()
     return df

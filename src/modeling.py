@@ -248,7 +248,7 @@ def _fit_torch_accelerated(
     n_train = len(x_train_s)
     for ep in range(epochs):
         if progress_cb:
-            progress_cb(66 + int(ep / epochs * 7), f"甇?閮毀??璅∪? (Epoch {ep+1}/{epochs})...")
+            progress_cb(66 + int(ep / epochs * 7), f"訓練分類模型（Epoch {ep+1}/{epochs}）")
         perm = np.random.permutation(n_train)
         for i in range(0, n_train, batch_size):
             idx = perm[i : i + batch_size]
@@ -276,7 +276,7 @@ def _fit_torch_accelerated(
 
     for ep in range(max(3, epochs // 2)):
         if progress_cb:
-            progress_cb(73 + int(ep / max(3, epochs // 2) * 7), f"甇?閮毀瑽▼?飛璅∪? (Epoch {ep+1}/{max(3, epochs // 2)})...")
+            progress_cb(73 + int(ep / max(3, epochs // 2) * 7), f"訓練槓桿模型（Epoch {ep+1}/{max(3, epochs // 2)}）")
         perm = np.random.permutation(n_train)
         for i in range(0, n_train, batch_size):
             idx = perm[i : i + batch_size]
@@ -384,12 +384,12 @@ def _fit_sklearn_rf(
         distill_applied = True
         if progress_cb:
             agree_pct = agree.mean() * 100
-            progress_cb(63, f"?賊冗瘛瑕?摰?嚗eacher/Student 銝?渡? {agree_pct:.1f}%嚗?憪?蝺?..")
+            progress_cb(63, f"蒸餾對齊完成：Teacher/Student 一致率 {agree_pct:.1f}%")
     else:
         y_train = pd.Series(y_train_hard)
 
     if progress_cb:
-        progress_cb(68, "甇?閮毀??璅∪? (RandomForest" + (" + Teacher?賊冗" if distill_applied else "") + ")...")
+        progress_cb(68, "訓練分類模型（RandomForest" + (" + Teacher 蒸餾" if distill_applied else "") + "）")
 
     clf = RandomForestClassifier(
         n_estimators=300,
@@ -436,7 +436,7 @@ def _fit_sklearn_rf(
 
     # ?? 撅?2嚗??典翰??RF ??warm-up ?葫嚗???Pinball 甈?蝎曄毀 ????
     if progress_cb:
-        progress_cb(74, "甇?閮毀瑽▼?飛 (RF warm-up)...")
+        progress_cb(74, "訓練槓桿模型（RF warm-up）")
     rf_warm = RandomForestRegressor(
         n_estimators=50,   # 敹恍?warm-up
         max_depth=6,
@@ -454,7 +454,7 @@ def _fit_sklearn_rf(
 
     # ?? 撅?3嚗 GradientBoosting Quantile ?飛嚗撱粹?撠迂 loss嚗???
     if progress_cb:
-        progress_cb(78, "甇?閮毀瑽▼?飛 (GB Quantile loss, tau=0.35)...")
+        progress_cb(78, "訓練槓桿模型（GB Quantile loss, tau=0.35）")
     gb_lev = GradientBoostingRegressor(
         n_estimators=200,
         max_depth=5,

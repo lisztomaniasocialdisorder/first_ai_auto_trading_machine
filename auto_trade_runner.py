@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -15,6 +16,11 @@ from src.data_sources import interval_to_seconds
 from src.paper_trade_okx import execute_latest_signal_okx
 from src.pipeline import run_quick_update
 from src.trade_journal import append_okx_order_record
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 def _utc_now_str() -> str:
