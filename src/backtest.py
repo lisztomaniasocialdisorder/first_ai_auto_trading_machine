@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .config import Settings
+from .data_sources import interval_to_seconds
 
 
 def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
@@ -83,13 +84,20 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_backtest(signal_df: pd.DataFrame, settings: Settings) -> tuple[pd.DataFrame, dict]:
+def run_backtest(signal_df: pd.DataFrame, settings: Settings, interval: str | None = None) -> tuple[pd.DataFrame, dict]:
     df = signal_df.copy().sort_values("timestamp").reset_index(drop=True)
 
-    df["ret_1h"] = df["close"].pct_change().fillna(0)
+    _interval = interval or getattr(settings, 'interval', '1h') or '1h'
+    try:
+        _bars_per_year = (365 * 24 * 3600) / max(1, interval_to_seconds(_interval))
+    except Exception:
+        _bars_per_year = 24 * 365
+    annual_factor = np.sqrt(_bars_per_year)
+
+    df["bar_ret"] = df["close"].pct_change().fillna(0)
     df["position"] = df["signal"].shift(1).fillna(0)
 
-    lev = df["suggested_leverage"].clip(lower=1, upper=settings.max_leverage)
+    lev = df["suggested_leverage"].shift(1).fillna(1.0).clip(lower=1, upper=settings.max_leverage)
     df["position_lev"] = df["position"] * lev
 
     turnover = (df["position"] - df["position"].shift(1).fillna(0)).abs()
@@ -97,7 +105,16 @@ def run_backtest(signal_df: pd.DataFrame, settings: Settings) -> tuple[pd.DataFr
     df["turnover"] = turnover
     df["trading_cost"] = trading_cost
 
-    df["strategy_ret"] = (df["position_lev"] * df["ret_1h"]) - trading_cost
+    try:
+        _funding_rate_8h = float(getattr(settings, 'funding_rate_8h_bps', 2.5) or 2.5) / 10_000
+        _interval_sec = max(1, interval_to_seconds(_interval))
+        _bars_per_8h = max(1.0, (8 * 3600) / _interval_sec)
+        funding_cost = df["position"].abs() * lev * (_funding_rate_8h / _bars_per_8h)
+    except Exception:
+        funding_cost = pd.Series(0.0, index=df.index)
+    df["funding_cost"] = funding_cost
+
+    df["strategy_ret"] = (df["position_lev"] * df["bar_ret"]) - trading_cost - funding_cost
 
     # Drawdown kill-switch
     equity = (1 + df["strategy_ret"]).cumprod()
@@ -131,7 +148,7 @@ def run_backtest(signal_df: pd.DataFrame, settings: Settings) -> tuple[pd.DataFr
     pnl_ratio = avg_win / avg_loss if avg_loss > 0 else np.nan
 
     total_return = equity.iloc[-1] - 1
-    annual_factor = np.sqrt(24 * 365)
+    # annual_factor computed dynamically above
     sharpe = df["strategy_ret"].mean() / (df["strategy_ret"].std() + 1e-12) * annual_factor
 
     downside = df["strategy_ret"].copy()
@@ -161,5 +178,6 @@ def run_backtest(signal_df: pd.DataFrame, settings: Settings) -> tuple[pd.DataFr
         "es_95": es_95,
         "avg_leverage": float(lev.mean()),
         "max_leverage_used": float(lev.max()),
+        "funding_rate_8h_bps": float(getattr(settings, 'funding_rate_8h_bps', 2.5) or 2.5),
     }
     return df, report

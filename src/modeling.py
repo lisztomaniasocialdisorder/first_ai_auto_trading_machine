@@ -678,7 +678,12 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
     p_short = proba[:, idx_map.get(-1, 0)] if -1 in idx_map else np.zeros(len(df))
     p_flat = proba[:, idx_map.get(0, 0)] if 0 in idx_map else np.zeros(len(df))
 
-    signal = np.where((p_long > 0.45) & (p_long > p_short), 1, np.where((p_short > 0.45) & (p_short > p_long), -1, 0))
+    signal_threshold = settings.get_signal_threshold()
+    signal = np.where(
+        (p_long > signal_threshold) & (p_long > p_short),
+        1,
+        np.where((p_short > signal_threshold) & (p_short > p_long), -1, 0),
+    )
 
     raw_lev = models.lev_reg.predict(x)
     confidence = np.maximum(p_long, p_short) - p_flat
@@ -697,7 +702,7 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
     out["max_safe_leverage"] = max_safe_lev.round(2)
 
     # ?? AI 靽∪?? & 撣憸冽嚗???K 蝺???? ?????????????????????
-    confidence_index = np.maximum(p_long + p_short - p_flat, 0.0)
+    confidence_index = np.maximum(p_long, p_short)
     out["confidence_index"] = confidence_index.round(4)
 
     def _classify_row_style(idx: int) -> str:

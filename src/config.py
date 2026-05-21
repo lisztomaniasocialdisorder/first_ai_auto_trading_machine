@@ -42,6 +42,9 @@ class Settings:
     promote_min_profit_factor_delta: float | None = None
     promote_min_trades: int | None = None
 
+    funding_rate_8h_bps: float | None = None
+    interval_signal_thresholds: dict | None = None
+
     def __post_init__(self) -> None:
         self.symbol = self.symbol or os.getenv("SYMBOL", "BTCUSDT")
         self.interval = self.interval or os.getenv("INTERVAL", "1h")
@@ -99,6 +102,16 @@ class Settings:
             else os.getenv("MODEL_PROMOTE_MIN_TRADES", "20")
         )
 
+        self.funding_rate_8h_bps = float(self.funding_rate_8h_bps if self.funding_rate_8h_bps is not None else os.getenv('FUNDING_RATE_8H_BPS', '2.5'))
+        self.interval_signal_thresholds = self.interval_signal_thresholds or {
+            '5m': 0.60, '15m': 0.55, '30m': 0.52,
+            '1h': 0.48, '4h': 0.46, '1d': 0.42,
+        }
+
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_signal_threshold(self) -> float:
+        """Return per-interval signal threshold."""
+        return float((self.interval_signal_thresholds or {}).get(self.interval or '1h', 0.48))

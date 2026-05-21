@@ -13,6 +13,7 @@ import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 
+from src.config import Settings
 from src.pipeline import run_pipeline, run_quick_update
 from src.snr import compute_snr_levels, merge_multitimeframe_levels
 from src.paper_trade_okx import execute_latest_signal_okx
@@ -481,6 +482,7 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
         sell_df = x[sell_mask]
 
         if not buy_df.empty:
+            buy_conf = (pd.to_numeric(buy_df.get("confidence_index", 0), errors="coerce").fillna(0) * 100).round(1)
             fig.add_trace(
                 go.Scatter(
                     x=buy_df["timestamp"],
@@ -489,12 +491,18 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
                     name="買點",
                     marker=dict(symbol="triangle-up", size=13, color="#22c55e",
                                 line=dict(color="#166534", width=1)),
-                    text=["▲"] * len(buy_df),
+                    text=[f"▲ {v:.0f}%" for v in buy_conf],
                     textposition="top center",
                     textfont=dict(color="#22c55e", size=10),
+                    customdata=buy_conf,
+                    hovertemplate=(
+                        "時間: %{x|%Y-%m-%d %H:%M:%S}<br>"
+                        "買點信心: %{customdata:.1f}%<extra></extra>"
+                    ),
                 )
             )
         if not sell_df.empty:
+            sell_conf = (pd.to_numeric(sell_df.get("confidence_index", 0), errors="coerce").fillna(0) * 100).round(1)
             fig.add_trace(
                 go.Scatter(
                     x=sell_df["timestamp"],
@@ -503,9 +511,14 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
                     name="賣點",
                     marker=dict(symbol="triangle-down", size=13, color="#ef4444",
                                 line=dict(color="#7f1d1d", width=1)),
-                    text=["▼"] * len(sell_df),
+                    text=[f"▼ {v:.0f}%" for v in sell_conf],
                     textposition="bottom center",
                     textfont=dict(color="#ef4444", size=10),
+                    customdata=sell_conf,
+                    hovertemplate=(
+                        "時間: %{x|%Y-%m-%d %H:%M:%S}<br>"
+                        "賣點信心: %{customdata:.1f}%<extra></extra>"
+                    ),
                 )
             )
     fig.update_layout(
@@ -1430,7 +1443,7 @@ if 推測週期秒數 > 0:
 最新收盤UTC, 最新收盤台北 = _format_ts_dual(最新收盤時間)
 
 # 訊號判斷（門檻由 AI 信心決定，不被用戶鎖定）
-_signal_threshold = 0.45  # AI 基礎門檻（固定，不讓用戶改）
+_signal_threshold = Settings(symbol=交易對, interval=週期).get_signal_threshold()
 訊號, 動作, 顏色類 = 判斷訊號(P看漲, P看跌, _signal_threshold)
 
 # ── 自動交易邏輯 ─────────────────────────────────────────────────────────────
