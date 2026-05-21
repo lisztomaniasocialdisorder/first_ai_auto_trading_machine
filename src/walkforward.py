@@ -10,6 +10,7 @@ import pandas as pd
 
 from .backtest import run_backtest
 from .config import Settings
+from .data_sources import interval_to_seconds
 from .modeling import infer_signals, train_models
 
 
@@ -40,6 +41,8 @@ def run_walkforward_validation(
     default_test_rows = max(150, int(total_rows * 0.10))
     fold_test_rows = int(test_rows or default_test_rows)
     fold_test_rows = max(100, min(fold_test_rows, max(100, total_rows // max(2, n_folds + 1))))
+    interval_sec = max(1, int(interval_to_seconds(settings.interval)))
+    embargo_bars = max(1, int(np.ceil((float(settings.future_horizon_hours) * 3600.0) / float(interval_sec))))
 
     wf_settings = replace(settings, max_train_rows=0)
     train_end = min_train
@@ -47,12 +50,14 @@ def run_walkforward_validation(
     fold_curves: list[pd.DataFrame] = []
 
     for fold_idx in range(1, n_folds + 1):
-        test_end = train_end + fold_test_rows
+        train_stop = max(min_train, train_end - embargo_bars)
+        test_start = min(total_rows, train_end + embargo_bars)
+        test_end = test_start + fold_test_rows
         if test_end > total_rows:
             break
 
-        train_df = x.iloc[:train_end].dropna().reset_index(drop=True)
-        test_df = x.iloc[train_end:test_end].copy().reset_index(drop=True)
+        train_df = x.iloc[:train_stop].dropna().reset_index(drop=True)
+        test_df = x.iloc[test_start:test_end].copy().reset_index(drop=True)
         if len(train_df) < wf_settings.min_train_rows or test_df.empty:
             break
 
@@ -66,6 +71,7 @@ def run_walkforward_validation(
                 "fold": fold_idx,
                 "train_rows": int(len(train_df)),
                 "test_rows": int(len(test_df)),
+                "embargo_bars": int(embargo_bars),
                 "train_start_utc": str(train_df["timestamp"].iloc[0]),
                 "train_end_utc": str(train_df["timestamp"].iloc[-1]),
                 "test_start_utc": str(test_df["timestamp"].iloc[0]),
@@ -104,6 +110,7 @@ def run_walkforward_validation(
         "source_end_utc": full_end,
         "fold_count": len(folds),
         "test_rows_per_fold": fold_test_rows,
+        "embargo_bars": int(embargo_bars),
         "summary": {
             "compounded_total_return": compounded_return,
             "average_fold_return": float(np.mean(fold_returns)),

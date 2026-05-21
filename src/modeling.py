@@ -690,22 +690,81 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
     conf_scale = np.clip(confidence * 2.0, 0.2, 1.0)
 
     max_safe_lev = compute_max_safe_leverage(df, settings.max_leverage)
-    leverage = np.clip(raw_lev * conf_scale, 1, settings.max_leverage)
-    leverage = np.minimum(leverage, max_safe_lev)
 
+    confidence_index = np.maximum(p_long, p_short)
     out = df.copy()
     out["p_long"] = p_long
     out["p_short"] = p_short
     out["p_flat"] = p_flat
     out["signal"] = signal
-    out["suggested_leverage"] = leverage.round(2)
-    out["max_safe_leverage"] = max_safe_lev.round(2)
-
-    # ?? AI 靽∪?? & 撣憸冽嚗???K 蝺???? ?????????????????????
-    confidence_index = np.maximum(p_long, p_short)
     out["confidence_index"] = confidence_index.round(4)
 
+    atr_pct = pd.to_numeric(out["atr_pct"], errors="coerce") if "atr_pct" in out.columns else pd.Series(np.nan, index=out.index)
+    realized_vol = pd.to_numeric(out["realized_vol_24"], errors="coerce") if "realized_vol_24" in out.columns else pd.Series(np.nan, index=out.index)
+    atr_pct = atr_pct.replace([np.inf, -np.inf], np.nan).fillna(0.015)
+    realized_vol = realized_vol.replace([np.inf, -np.inf], np.nan).fillna(0.03)
+
+    regime = out["regime"].astype(str).str.lower() if "regime" in out.columns else pd.Series("ranging", index=out.index, dtype=str)
+    plus_di = pd.to_numeric(out["plus_di"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0) if "plus_di" in out.columns else pd.Series(0.0, index=out.index)
+    minus_di = pd.to_numeric(out["minus_di"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0) if "minus_di" in out.columns else pd.Series(0.0, index=out.index)
+
+    regime_bias = np.where(plus_di.to_numpy() >= minus_di.to_numpy(), 1, -1)
+    regime_strength = np.clip(np.abs(plus_di.to_numpy() - minus_di.to_numpy()) / 100.0, 0.0, 1.0)
+    expected_move_pct = np.clip(np.maximum(atr_pct.to_numpy(), realized_vol.to_numpy()) * (0.45 + 1.1 * confidence_index), 0.0, 0.25)
+    round_trip_cost_pct = (
+        ((float(settings.fee_bps) + float(settings.slippage_bps)) * 2.0) / 10_000.0
+        + (float(getattr(settings, "funding_rate_8h_bps", 2.5) or 2.5) / 10_000.0) * (float(settings.future_horizon_hours) / 8.0)
+    )
+    buffer_pct = np.where(
+        regime.to_numpy() == "trend",
+        0.0010,
+        np.where(regime.to_numpy() == "volatile", 0.0018, 0.0015),
+    )
+    expected_cost_pct = round_trip_cost_pct + buffer_pct
+    net_edge_pct = expected_move_pct - expected_cost_pct
+
+    regime_leverage_cap = np.where(
+        regime.to_numpy() == "trend",
+        np.minimum(float(settings.max_leverage), np.maximum(1.0, max_safe_lev)),
+        np.where(
+            regime.to_numpy() == "volatile",
+            np.minimum(2.0, np.maximum(1.0, max_safe_lev)),
+            np.minimum(1.5, np.maximum(1.0, max_safe_lev)),
+        ),
+    )
+    leverage = np.clip(raw_lev * conf_scale, 1, settings.max_leverage)
+    leverage = np.minimum(leverage, max_safe_lev)
+    leverage = np.minimum(leverage, regime_leverage_cap)
+
+    out["suggested_leverage"] = leverage.round(2)
+    out["max_safe_leverage"] = max_safe_lev.round(2)
+    out["regime_bias"] = regime_bias
+    out["regime_strength"] = np.round(regime_strength, 4)
+    out["expected_move_pct"] = np.round(expected_move_pct, 4)
+    out["expected_cost_pct"] = np.round(expected_cost_pct, 4)
+    out["net_edge_pct"] = np.round(net_edge_pct, 4)
+    out["regime_alignment"] = np.where(signal == regime_bias, 1, 0)
+
+    trade_allowed = signal != 0
+    block_reason = np.full(len(out), "", dtype=object)
+    flat_mask = signal == 0
+    edge_mask = (~flat_mask) & (net_edge_pct <= 0)
+    trend_mask = (regime.to_numpy() == "trend") & (~flat_mask) & (signal != regime_bias)
+    volatile_mask = (regime.to_numpy() == "volatile") & (~flat_mask) & (confidence_index < (signal_threshold + 0.05))
+    ranging_mask = (regime.to_numpy() == "ranging") & (~flat_mask) & (confidence_index < (signal_threshold + 0.02))
+    trade_allowed = trade_allowed & (~edge_mask) & (~trend_mask) & (~volatile_mask) & (~ranging_mask)
+    block_reason = np.where(flat_mask, "flat signal", block_reason)
+    block_reason = np.where(edge_mask, "expected edge <= cost", block_reason)
+    block_reason = np.where(trend_mask, "trend regime mismatch", block_reason)
+    block_reason = np.where(volatile_mask, "volatile regime needs stronger confidence", block_reason)
+    block_reason = np.where(ranging_mask, "ranging regime needs stronger confidence", block_reason)
+    out["trade_allowed"] = trade_allowed.astype(int)
+    out["trade_block_reason"] = block_reason
+    out["trade_net_edge_pct"] = np.round(net_edge_pct, 4)
+    out["trade_expected_cost_pct"] = np.round(expected_cost_pct, 4)
+
     def _classify_row_style(idx: int) -> str:
+
         fg = float(out.at[idx, "fear_greed_value"]) if "fear_greed_value" in out.columns else 50.0
         vol24 = float(out.at[idx, "realized_vol_24"]) if "realized_vol_24" in out.columns else 0.03
         atr_p = float(out.at[idx, "atr_pct"]) if "atr_pct" in out.columns else 0.015

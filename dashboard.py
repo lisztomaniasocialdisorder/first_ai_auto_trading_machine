@@ -544,6 +544,71 @@ def 回測顯示值(指標: str, value: object) -> object:
     return v
 
 
+def _樣本數顯示(value: object, note: str | None = None) -> str:
+    if value is None:
+        return note or "—"
+    try:
+        return f"{int(value):,} 根"
+    except Exception:
+        return str(value)
+
+
+def _latest_timestamp_from_csv(path: Path) -> pd.Timestamp | None:
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path, usecols=["timestamp"])
+        if df.empty:
+            return None
+        ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
+
+
+def _build_data_health_snapshot(symbol: str, interval: str, signals_df: pd.DataFrame, report: dict | None = None) -> dict[str, object]:
+    report_health = report.get("data_health", {}) if isinstance(report, dict) else {}
+    raw_ts = pd.to_datetime(report_health.get("raw_end_utc"), utc=True, errors="coerce") if report_health.get("raw_end_utc") else None
+    feat_ts = pd.to_datetime(report_health.get("feature_end_utc"), utc=True, errors="coerce") if report_health.get("feature_end_utc") else None
+    current_ts = pd.to_datetime(report_health.get("latest_timestamp_utc"), utc=True, errors="coerce") if report_health.get("latest_timestamp_utc") else None
+
+    if current_ts is None or pd.isna(current_ts):
+        if not signals_df.empty and "timestamp" in signals_df.columns:
+            current_ts = pd.to_datetime(signals_df["timestamp"].iloc[-1], utc=True, errors="coerce")
+        elif feat_ts is not None and not pd.isna(feat_ts):
+            current_ts = feat_ts
+
+    interval_sec = max(1, _infer_interval_seconds_from_signals(signals_df) or _interval_seconds(interval))
+    age_seconds = None
+    if report_health.get("age_seconds") is not None:
+        try:
+            age_seconds = float(report_health.get("age_seconds"))
+        except Exception:
+            age_seconds = None
+    if age_seconds is None and current_ts is not None and not pd.isna(current_ts):
+        now_ts = pd.Timestamp.now(tz="UTC")
+        age_seconds = max(0.0, (now_ts - current_ts).total_seconds())
+    stale_threshold = float(report_health.get("stale_threshold_seconds") or max(float(interval_sec) * 3.0, 2.0 * 3600.0))
+    is_stale = bool(report_health.get("is_stale")) if report_health else bool(age_seconds is not None and age_seconds > stale_threshold)
+
+    if (raw_ts is None or pd.isna(raw_ts)) and feat_ts is None:
+        raw_path = BASE_DIR / "data" / f"{symbol}_{interval}_ohlcv.csv"
+        feat_path = OUTPUT_DIR / f"signals_with_features_{symbol}_{interval}.csv"
+        raw_ts = _latest_timestamp_from_csv(raw_path)
+        feat_ts = _latest_timestamp_from_csv(feat_path)
+    return {
+        "raw_ts": raw_ts,
+        "feat_ts": feat_ts,
+        "latest_ts": current_ts,
+        "age_seconds": age_seconds,
+        "stale_threshold_seconds": stale_threshold,
+        "is_stale": is_stale,
+        "report_data_health": report_health,
+    }
+
+
 def 判斷訊號(p_long: float, p_short: float, 門檻: float) -> tuple[str, str, str]:
     if p_long >= 門檻 and p_long > p_short:
         return "看漲", "買入 / 做多", "signal-bull"
@@ -1531,6 +1596,7 @@ if 即時更新啟用:
 signals = 讀取訊號資料()
 report = 讀取報告()
 trades_df = 讀取交易明細(交易對, 週期)
+資料健康 = _build_data_health_snapshot(交易對, 週期, signals, report)
 
 if signals.empty:
     raw_path = BASE_DIR / "data" / f"{交易對}_{週期}_ohlcv.csv"
@@ -1547,6 +1613,14 @@ if signals.empty:
         "請先按左側「增量更新+重訓回測」建立該週期訊號後再顯示模型結果。"
     )
     st.stop()
+
+if 資料健康.get("is_stale", False):
+    _latest_ts = 資料健康.get("latest_ts")
+    _age_hours = float(資料健康.get("age_seconds", 0.0) or 0.0) / 3600.0
+    st.warning(
+        f"資料健康警告：最新訊號時間偏舊（{_latest_ts}），距今約 {_age_hours:.2f} 小時。"
+        " 目前自動交易與回測會以這個訊號檔為準，建議先重跑資料更新。"
+    )
 
 if "okx_last" in st.session_state:
     with st.expander("OKX 模擬盤下單回應"):
@@ -1629,6 +1703,10 @@ regime_key = str(最新.get("regime", "ranging") or "ranging").lower()
     "ranging": "盤整盤",
 }.get(regime_key, "未判定")
 
+_data_latest = 資料健康.get("latest_ts") or 最新["timestamp"]
+_data_age_hours = float(資料健康.get("age_seconds", 0.0) or 0.0) / 3600.0 if 資料健康.get("age_seconds") is not None else None
+_data_status = "過期" if 資料健康.get("is_stale", False) else "正常"
+
 # ── 自動交易邏輯 ─────────────────────────────────────────────────────────────
 if 自動交易啟用:
     if not okx_enable:
@@ -1663,13 +1741,25 @@ if 自動交易啟用:
                 st.session_state["auto_trade_last_msg"] = f"止損出場 (SL {float(自動止損百分比):.1f}%) 入場:{entry:,.2f}"
 
         上次訊號簽名 = str(st.session_state.get("auto_trade_last_signal_sig", ""))
-        目前訊號簽名 = f"{最新['timestamp']}|{int(取得數值(最新,'signal',0))}|{float(取得數值(最新,'suggested_leverage',1.0)):.2f}"
+        目前訊號簽名 = (
+            f"{最新['timestamp']}|{int(取得數值(最新,'signal',0))}|"
+            f"{float(取得數值(最新,'suggested_leverage',1.0)):.2f}|"
+            f"{int(取得數值(最新,'trade_allowed',1))}|"
+            f"{str(最新.get('trade_block_reason', ''))}"
+        )
         if 目前訊號簽名 != 上次訊號簽名 and not st.session_state.get("auto_pos_state"):
             _auto_res = _run_okx("AUTO")
             st.session_state["auto_trade_last_signal_sig"] = 目前訊號簽名
             _risk = (_auto_res or {}).get("risk_controls", {}) if isinstance(_auto_res, dict) else {}
-            if bool(_risk.get("hold_due_to_black_swan", False)):
-                st.session_state["auto_trade_last_msg"] = "黑天鵝風險啟動：自動交易暫停，請手動操作倉位。"
+            _auto_action = str((_auto_res or {}).get("action", "") or "")
+            _auto_note = str(_risk.get("note", "") or "").strip()
+            if _auto_action == "HOLD":
+                if _auto_note:
+                    st.session_state["auto_trade_last_msg"] = f"純AI自動交易 HOLD：{_auto_note}"
+                elif bool(_risk.get("hold_due_to_black_swan", False)):
+                    st.session_state["auto_trade_last_msg"] = "黑天鵝風險啟動：自動交易暫停，請手動操作倉位。"
+                else:
+                    st.session_state["auto_trade_last_msg"] = "純AI自動交易 HOLD（未送單）"
             else:
                 st.session_state["auto_trade_last_msg"] = f"純AI自動交易已執行（新訊號）：{最新['timestamp']}"
         if st.session_state.get("auto_trade_last_msg"):
@@ -1776,6 +1866,14 @@ with 監控列[1]:
             </div>""",
         unsafe_allow_html=True,
     )
+
+st.markdown(
+    f"""<div class="subtle">
+          資料最新時間：{_data_latest} | 資料狀態：{_data_status}
+          {f" | 距今約 {_data_age_hours:.2f} 小時" if _data_age_hours is not None else ""}
+        </div>""",
+    unsafe_allow_html=True,
+)
 
 控制列 = st.columns([1.35, 1.15])
 with 控制列[0]:
@@ -2117,10 +2215,12 @@ with 分頁[7]:
             unsafe_allow_html=True,
         )
         _tm = report.get("train_metrics", {}) if isinstance(report.get("train_metrics"), dict) else {}
+        _tm_note = str(_tm.get("note", "") or "")
+        _tm_placeholder = "快更未重訓" if _tm_note else "—"
         _split_cols = st.columns(3)
         _split_cards = [
-            ("訓練樣本", f"{int(_tm.get('train_rows', 0) or 0):,} 根", "模型實際訓練使用的樣本數"),
-            ("驗證樣本", f"{int(_tm.get('test_rows', 0) or 0):,} 根", "模型訓練時保留的樣本外驗證區"),
+            ("訓練樣本", _樣本數顯示(_tm.get("train_rows"), _tm_placeholder), "模型實際訓練使用的樣本數"),
+            ("驗證樣本", _樣本數顯示(_tm.get("test_rows"), _tm_placeholder), "模型訓練時保留的樣本外驗證區"),
             ("回測樣本", f"{len(回測樣本區):,} 根", "目前回測摘要使用的樣本數"),
         ]
         for _col, (_title, _value, _hint) in zip(_split_cols, _split_cards):
@@ -2160,6 +2260,29 @@ with 分頁[7]:
             st.markdown("#### 權益曲線指標")
             curve_df = pd.DataFrame(curve_items, columns=["指標", "數值"])
             st.dataframe(_safe_df(curve_df), use_container_width=True, hide_index=True)
+
+        stress_tests = bt.get("cost_stress_tests", {}) if isinstance(bt.get("cost_stress_tests"), dict) else {}
+        if stress_tests:
+            st.markdown("#### 成本壓力測試")
+            stress_rows = []
+            for _name in ["optimistic", "realistic", "stressed", "disaster"]:
+                _sc = stress_tests.get(_name)
+                if not isinstance(_sc, dict):
+                    continue
+                stress_rows.append(
+                    {
+                        "情境": _name,
+                        "手續費(bps)": _sc.get("fee_bps"),
+                        "滑價(bps)": _sc.get("slippage_bps"),
+                        "總收益": 回測顯示值("總收益", _sc.get("total_return")),
+                        "勝率": 回測顯示值("勝率", _sc.get("win_rate")),
+                        "盈虧比": _sc.get("pnl_ratio"),
+                        "期望值": float(_sc.get("expectancy_unit", 0.0) or 0.0),
+                        "交易筆數": int(_sc.get("trades", 0) or 0),
+                    }
+                )
+            if stress_rows:
+                st.dataframe(_safe_df(pd.DataFrame(stress_rows)), use_container_width=True, hide_index=True)
 
         st.markdown("#### Walk-Forward")
         _wf_cols = st.columns([1.2, 2.8])

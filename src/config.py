@@ -105,7 +105,7 @@ class Settings:
         self.funding_rate_8h_bps = float(self.funding_rate_8h_bps if self.funding_rate_8h_bps is not None else os.getenv('FUNDING_RATE_8H_BPS', '2.5'))
         self.interval_signal_thresholds = self.interval_signal_thresholds or {
             '5m': 0.60, '15m': 0.55, '30m': 0.52,
-            '1h': 0.48, '4h': 0.46, '1d': 0.42,
+            '1h': 0.48, '1d': 0.42,
         }
 
         self.data_dir.mkdir(parents=True, exist_ok=True)

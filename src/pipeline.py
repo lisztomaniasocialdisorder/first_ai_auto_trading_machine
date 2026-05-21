@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -131,7 +132,81 @@ def _promotion_gate(
         except Exception:
             pass
 
+    stress_tests = candidate_report.get("cost_stress_tests")
+    if isinstance(stress_tests, dict):
+        for scenario_name in ("realistic", "stressed"):
+            scenario = stress_tests.get(scenario_name)
+            if not isinstance(scenario, dict):
+                continue
+            scenario_return = _num(scenario, "total_return")
+            scenario_expectancy = _num(scenario, "expectancy_unit")
+            if scenario_return <= 0:
+                reasons.append(f"{scenario_name} cost stress total_return not positive ({scenario_return:.4f})")
+            if scenario_expectancy <= 0:
+                reasons.append(f"{scenario_name} cost stress expectancy not positive ({scenario_expectancy:.4f})")
+
     return (len(reasons) == 0), reasons
+
+
+def _build_data_health(ohlcv: pd.DataFrame, inferred: pd.DataFrame, settings: Settings) -> dict:
+    raw = ohlcv.copy().sort_values("timestamp").reset_index(drop=True) if not ohlcv.empty else pd.DataFrame()
+    feat = inferred.copy().sort_values("timestamp").reset_index(drop=True) if not inferred.empty else pd.DataFrame()
+    latest_ts = None
+    if not feat.empty and "timestamp" in feat.columns:
+        latest_ts = pd.to_datetime(feat["timestamp"].iloc[-1], utc=True, errors="coerce")
+    elif not raw.empty and "timestamp" in raw.columns:
+        latest_ts = pd.to_datetime(raw["timestamp"].iloc[-1], utc=True, errors="coerce")
+    interval_sec = max(1, int(interval_to_seconds(settings.interval)))
+    age_seconds = None
+    if latest_ts is not None and not pd.isna(latest_ts):
+        age_seconds = max(0.0, (datetime.now(tz=timezone.utc) - latest_ts.to_pydatetime()).total_seconds())
+    stale_threshold = max(float(interval_sec) * 3.0, float(settings.quick_window_days) * 24.0 * 3600.0 / 2.0)
+    data_stale = bool(age_seconds is not None and age_seconds > stale_threshold)
+    return {
+        "raw_rows": int(len(raw)),
+        "raw_start_utc": str(raw["timestamp"].iloc[0]) if not raw.empty else "",
+        "raw_end_utc": str(raw["timestamp"].iloc[-1]) if not raw.empty else "",
+        "feature_rows": int(len(feat)),
+        "feature_start_utc": str(feat["timestamp"].iloc[0]) if not feat.empty else "",
+        "feature_end_utc": str(feat["timestamp"].iloc[-1]) if not feat.empty else "",
+        "latest_timestamp_utc": str(latest_ts) if latest_ts is not None and not pd.isna(latest_ts) else "",
+        "age_seconds": float(age_seconds) if age_seconds is not None else None,
+        "stale_threshold_seconds": float(stale_threshold),
+        "is_stale": data_stale,
+    }
+
+
+def _run_cost_stress_suite(inferred: pd.DataFrame, settings: Settings, interval: str) -> dict:
+    scenarios = {
+        "optimistic": (float(settings.fee_bps), float(settings.slippage_bps)),
+        "realistic": (max(float(settings.fee_bps), 8.0), max(float(settings.slippage_bps), 8.0)),
+        "stressed": (max(float(settings.fee_bps), 10.0), max(float(settings.slippage_bps), 15.0)),
+        "disaster": (max(float(settings.fee_bps), 15.0), max(float(settings.slippage_bps), 30.0)),
+    }
+    out: dict[str, dict] = {}
+    for name, (fee_bps, slippage_bps) in scenarios.items():
+        scenario_settings = replace(settings, fee_bps=fee_bps, slippage_bps=slippage_bps)
+        _, rpt = run_backtest(inferred.copy(), scenario_settings, interval=interval)
+        expectancy = 0.0
+        try:
+            wr = float(rpt.get("win_rate", 0.0) or 0.0)
+            rr = float(rpt.get("pnl_ratio", 0.0) or 0.0)
+            expectancy = (max(0.0, min(1.0, wr)) * max(0.0, rr)) - (1.0 - max(0.0, min(1.0, wr)))
+        except Exception:
+            expectancy = 0.0
+        out[name] = {
+            "fee_bps": float(fee_bps),
+            "slippage_bps": float(slippage_bps),
+            "rows": int(rpt.get("rows", 0) or 0),
+            "trades": int(rpt.get("trades", 0) or 0),
+            "total_return": float(rpt.get("total_return", 0.0) or 0.0),
+            "max_drawdown": float(rpt.get("max_drawdown", 0.0) or 0.0),
+            "win_rate": float(rpt.get("win_rate", 0.0) or 0.0),
+            "profit_factor": float(rpt.get("profit_factor", 0.0) or 0.0) if rpt.get("profit_factor") is not None else None,
+            "pnl_ratio": float(rpt.get("pnl_ratio", 0.0) or 0.0) if rpt.get("pnl_ratio") is not None else None,
+            "expectancy_unit": float(expectancy),
+        }
+    return out
 
 
 def _write_outputs(
@@ -140,6 +215,7 @@ def _write_outputs(
     train_metrics: dict,
     bt_report: dict,
     settings: Settings,
+    data_health: dict | None = None,
 ) -> dict:
     latest = bt_curve.iloc[-1]
     decision = {
@@ -158,6 +234,8 @@ def _write_outputs(
         "latest_decision": decision,
         "generated_at_utc": datetime.now(tz=timezone.utc).isoformat(),
     }
+    if data_health:
+        results["data_health"] = data_health
 
     tag = f"{settings.symbol}_{settings.interval}"
     bt_curve.to_csv(settings.output_dir / f"backtest_curve_{tag}.csv", index=False)
@@ -239,8 +317,10 @@ def run_pipeline(
 
     inferred = infer_signals(labeled_full, models, settings)
     bt_curve, bt_report = run_backtest(inferred, settings)
+    data_health = _build_data_health(ohlcv, inferred, settings)
+    bt_report["cost_stress_tests"] = _run_cost_stress_suite(inferred, settings, settings.interval)
     if progress_cb:
-        progress_cb(95, "回測完成，寫入輸出檔")
+        progress_cb(95, "???????????????")
 
     production_report_path = settings.output_dir / f"production_report_{tag}.json"
     previous_production_report = _read_json(production_report_path)
@@ -274,7 +354,7 @@ def run_pipeline(
     }
     _write_json(settings.output_dir / f"model_promotion_{tag}.json", promotion_status)
 
-    out = _write_outputs(inferred, bt_curve, train_metrics, bt_report, settings)
+    out = _write_outputs(inferred, bt_curve, train_metrics, bt_report, settings, data_health=data_health)
     out["model_promotion"] = promotion_status
     _write_json(settings.output_dir / f"report_{tag}.json", out)
     _write_json(settings.output_dir / "report.json", out)
@@ -306,6 +386,8 @@ def run_quick_update(symbol: str | None = None, interval: str | None = None) -> 
     models = load_models(model_dir)
     inferred = infer_signals(labeled_full, models, settings)
     bt_curve, bt_report = run_backtest(inferred, settings)
+    data_health = _build_data_health(ohlcv, inferred, settings)
+    bt_report["cost_stress_tests"] = _run_cost_stress_suite(inferred, settings, settings.interval)
 
     train_metrics = {
         "note": "quick_update used saved models (no retraining)",
@@ -314,7 +396,7 @@ def run_quick_update(symbol: str | None = None, interval: str | None = None) -> 
         "training_backend": getattr(models, "backend", "unknown"),
         "training_device": ((getattr(models, "backend_meta", {}) or {}).get("device", "unknown")),
     }
-    return _write_outputs(inferred, bt_curve, train_metrics, bt_report, settings)
+    return _write_outputs(inferred, bt_curve, train_metrics, bt_report, settings, data_health=data_health)
 
 
 def pretty_print_results(results: dict) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timezone
 
 import pandas as pd
 
@@ -43,6 +44,34 @@ def compute_drift_alerts(
     recent = signals_df.iloc[-window:].copy()
     full = signals_df.copy()
 
+    if "timestamp" in signals_df.columns:
+        try:
+            latest_ts = pd.to_datetime(signals_df["timestamp"].iloc[-1], utc=True, errors="coerce")
+            if not pd.isna(latest_ts):
+                now = pd.Timestamp.now(tz=timezone.utc)
+                age_seconds = max(0.0, (now - latest_ts).total_seconds())
+                if len(signals_df) >= 2:
+                    diffs = pd.to_datetime(signals_df["timestamp"], utc=True, errors="coerce").diff().dt.total_seconds().dropna()
+                    interval_seconds = float(diffs.median()) if not diffs.empty else 0.0
+                else:
+                    interval_seconds = 0.0
+                stale_threshold = max(3.0 * interval_seconds, 2.0 * 3600.0)
+                triggered = age_seconds > stale_threshold
+                severity = "critical" if age_seconds > stale_threshold * 2 else ("warning" if triggered else "ok")
+                alerts.append(
+                    DriftAlert(
+                        metric="data_freshness",
+                        current=round(age_seconds / 3600.0, 4),
+                        baseline=round(stale_threshold / 3600.0, 4),
+                        threshold=round(stale_threshold / 3600.0, 4),
+                        triggered=triggered,
+                        severity=severity,
+                        message=f"資料最新時間距今 {age_seconds/3600.0:.2f} 小時，超過容忍門檻 {stale_threshold/3600.0:.2f} 小時",
+                    )
+                )
+        except Exception:
+            pass
+
     if "confidence_index" in signals_df.columns:
         recent_conf = float(pd.to_numeric(recent["confidence_index"], errors="coerce").fillna(0).mean())
         full_conf = float(pd.to_numeric(full["confidence_index"], errors="coerce").fillna(0).mean())
@@ -57,6 +86,24 @@ def compute_drift_alerts(
                 triggered=triggered,
                 severity=severity,
                 message=f"近期平均信心 {recent_conf:.3f}，低於門檻 {confidence_floor:.3f}",
+            )
+        )
+
+    if "trade_allowed" in signals_df.columns:
+        recent_allowed = float(pd.to_numeric(recent["trade_allowed"], errors="coerce").fillna(0).mean())
+        full_allowed = float(pd.to_numeric(full["trade_allowed"], errors="coerce").fillna(0).mean())
+        drift = abs(recent_allowed - full_allowed)
+        triggered = recent_allowed < 0.25 or drift > 0.25
+        severity = "critical" if recent_allowed < 0.15 else ("warning" if triggered else "ok")
+        alerts.append(
+            DriftAlert(
+                metric="trade_allowed_rate",
+                current=round(recent_allowed, 4),
+                baseline=round(full_allowed, 4),
+                threshold=0.25,
+                triggered=triggered,
+                severity=severity,
+                message=f"可交易率 {recent_allowed:.2%}，全期平均 {full_allowed:.2%}，偏移 {drift:.2%}",
             )
         )
 

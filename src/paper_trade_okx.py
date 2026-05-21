@@ -10,6 +10,7 @@ import pandas as pd
 
 from .cache import JsonCache
 from .exchange_okx import OKXClient, OKXCredentials
+from .data_sources import interval_to_seconds
 
 
 @dataclass
@@ -88,6 +89,35 @@ def _signal_direction(sig: int) -> int:
     if sig < 0:
         return -1
     return 0
+
+
+def _parse_latest_timestamp(row: dict[str, Any]) -> pd.Timestamp | None:
+    for key in ("timestamp", "decision_timestamp"):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            continue
+        ts = pd.to_datetime(raw, utc=True, errors="coerce")
+        if not pd.isna(ts):
+            return ts
+    return None
+
+
+def _signal_freshness(outputs_dir: Path, symbol: str, interval: str) -> dict[str, Any]:
+    row = _load_latest_signal_row(outputs_dir, symbol, interval)
+    ts = _parse_latest_timestamp(row)
+    interval_sec = max(1, int(interval_to_seconds(interval)))
+    now = pd.Timestamp.now(tz="UTC")
+    age_seconds = None
+    if ts is not None:
+        age_seconds = max(0.0, (now - ts).total_seconds())
+    stale_threshold = max(float(interval_sec) * 3.0, 2.0 * 3600.0)
+    is_stale = bool(age_seconds is not None and age_seconds > stale_threshold)
+    return {
+        "latest_timestamp_utc": str(ts) if ts is not None and not pd.isna(ts) else "",
+        "age_seconds": age_seconds,
+        "stale_threshold_seconds": float(stale_threshold),
+        "is_stale": is_stale,
+    }
 
 
 def _load_mtf_snapshot(outputs_dir: Path, symbol: str, intervals: tuple[str, ...]) -> dict[str, dict[str, Any]]:
@@ -307,6 +337,7 @@ def execute_latest_signal_okx(
 
     decision = _load_latest_decision(outputs_dir, symbol, interval)
     latest_row = _load_latest_signal_row(outputs_dir, symbol, interval)
+    freshness = _signal_freshness(outputs_dir, symbol, interval)
     mtf_snapshot = _load_mtf_snapshot(outputs_dir, symbol, ("5m", "15m", "30m", "1h", "1d"))
     mtf_gate = _pick_mtf_consensus(mtf_snapshot)
     sig = int(decision.get("signal", 0))
@@ -317,6 +348,16 @@ def execute_latest_signal_okx(
     war_news_score = float(latest_row.get("war_news_score", 0.0) or 0.0)
     macro_event_risk_score = float(latest_row.get("macro_event_risk_score", 0.0) or 0.0)
     market_panic_score = float(latest_row.get("market_panic_score", 0.0) or 0.0)
+    trade_allowed = bool(int(latest_row.get("trade_allowed", 1) or 0))
+    trade_block_reason = str(latest_row.get("trade_block_reason", "") or "").strip()
+    regime = str(latest_row.get("regime", "ranging") or "ranging").lower()
+    regime_bias = int(latest_row.get("regime_bias", 0) or 0)
+    regime_alignment = int(latest_row.get("regime_alignment", 0) or 0)
+    net_edge_pct = float(latest_row.get("net_edge_pct", 0.0) or 0.0)
+    expected_cost_pct = float(latest_row.get("expected_cost_pct", 0.0) or 0.0)
+    confidence_index = float(latest_row.get("confidence_index", 0.0) or 0.0)
+    plus_di = float(latest_row.get("plus_di", 0.0) or 0.0)
+    minus_di = float(latest_row.get("minus_di", 0.0) or 0.0)
     mode = action_override or "AUTO"
 
     effective_notional_usdt = float(cfg.notional_usdt)
@@ -330,6 +371,10 @@ def execute_latest_signal_okx(
     if black_swan_active and mode == "AUTO":
         hold_due_to_black_swan = True
         risk_control_note = "hold: black swan active, auto trading paused; manual control only"
+
+    if freshness.get("is_stale", False) and mode != "CLOSE":
+        hold_due_to_black_swan = True
+        risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "data stale: signal snapshot too old"
 
     # For AUTO mode (non-black-swan hold), cap notional by reserve policy.
     if (not hold_due_to_black_swan) and mode == "AUTO" and cfg.black_swan_reserve_usdt > 0:
@@ -365,12 +410,25 @@ def execute_latest_signal_okx(
         desired = -1
         risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "panic regime: prefer short"
 
+    if mode == "AUTO" and not trade_allowed and not hold_due_to_black_swan:
+        desired = 0
+        note = trade_block_reason or "trade not allowed"
+        risk_control_note = (risk_control_note + " | " if risk_control_note else "") + f"trade gate: {note}"
+
+    if mode == "AUTO" and desired != 0 and regime == "trend" and regime_alignment == 0:
+        desired = 0
+        risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "regime gate: trend direction mismatch"
+
     if hold_due_to_black_swan and mode != "CLOSE":
         desired = 0
 
     lever = int(leverage_override or min(cfg.max_leverage, max(1, int(round(suggested_lev)))))
     if mode == "AUTO" and desired != 0:
         lever = min(lever, int(mtf_gate.get("leverage_cap", lever) or lever))
+        if regime == "volatile":
+            lever = min(lever, 2)
+        elif regime == "ranging":
+            lever = min(lever, 1)
     if mode == "AUTO":
         if macro_event_risk_score > 0:
             # CPI/PPI/FOMC release windows: auto reduce risk.
@@ -562,6 +620,12 @@ def execute_latest_signal_okx(
         "set_leverage_response": lev_resp,
         "order_response": order_resp,
         "effective_notional_usdt": float(effective_notional_usdt),
+        "data_health": {
+            "latest_timestamp_utc": freshness.get("latest_timestamp_utc", ""),
+            "age_seconds": freshness.get("age_seconds"),
+            "stale_threshold_seconds": float(freshness.get("stale_threshold_seconds", 0.0) or 0.0),
+            "is_stale": bool(freshness.get("is_stale", False)),
+        },
         "risk_controls": {
             "black_swan_score": float(black_swan_score),
             "black_swan_threshold": float(cfg.black_swan_threshold),
@@ -573,6 +637,13 @@ def execute_latest_signal_okx(
             "macro_event_risk_score": float(macro_event_risk_score),
             "market_panic_score": float(market_panic_score),
             "panic_regime": bool(panic_regime),
+            "regime": regime,
+            "regime_bias": int(regime_bias),
+            "regime_alignment": int(regime_alignment),
+            "trade_allowed": bool(trade_allowed),
+            "trade_block_reason": trade_block_reason,
+            "net_edge_pct": float(net_edge_pct),
+            "expected_cost_pct": float(expected_cost_pct),
             "note": risk_control_note,
             "mtf_gate": {
                 "direction": int(mtf_gate.get("direction", 0) or 0),
