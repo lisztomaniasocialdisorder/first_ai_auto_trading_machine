@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,7 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy().sort_values("timestamp").reset_index(drop=True)
     pos = x["position"].fillna(0).to_numpy()
 
-    entries = []
+    entries: list[tuple[int, int, int]] = []
     in_trade = False
     entry_i = 0
     entry_side = 0
@@ -27,13 +27,11 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
             entry_i = i
             entry_side = curr
         elif in_trade:
-            # Exit when position goes flat or flips.
             if curr == 0 or curr != entry_side:
                 exit_i = i
                 entries.append((entry_i, exit_i, entry_side))
                 in_trade = False
                 if curr != 0:
-                    # immediate flip => new entry at same bar
                     in_trade = True
                     entry_i = i
                     entry_side = curr
@@ -41,7 +39,7 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
     if in_trade:
         entries.append((entry_i, len(x) - 1, entry_side))
 
-    rows = []
+    rows: list[dict] = []
     for en, ex, side in entries:
         entry_ts = x.loc[en, "timestamp"]
         exit_ts = x.loc[ex, "timestamp"]
@@ -49,16 +47,13 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
         exit_px = float(x.loc[ex, "close"])
         lev = float(abs(x.loc[en, "position_lev"])) if "position_lev" in x.columns else 1.0
 
-        # Sum per-bar strategy returns during the holding window (inclusive).
         seg = x.loc[en:ex, "strategy_ret"].fillna(0.0)
         seg_cost = x.loc[en:ex, "trading_cost"].fillna(0.0) if "trading_cost" in x.columns else 0.0
         trade_ret = float((1.0 + seg).prod() - 1.0)
         trade_cost = float(seg_cost.sum()) if hasattr(seg_cost, "sum") else 0.0
 
-        # Directional price return for reference.
         px_ret = (exit_px / entry_px - 1.0) * (1.0 if side > 0 else -1.0)
 
-        # MFE/MAE using close-only proxy
         closes = x.loc[en:ex, "close"].astype(float)
         rel = (closes / entry_px - 1.0) * (1.0 if side > 0 else -1.0)
         mfe = float(rel.max())
@@ -66,17 +61,29 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append(
             {
+                "entry_time": str(entry_ts),
+                "exit_time": str(exit_ts),
+                "side": "long" if side > 0 else "short",
+                "leverage": round(lev, 2),
+                "entry_price": entry_px,
+                "exit_price": exit_px,
+                "price_return": px_ret,
+                "strategy_return": trade_ret,
+                "trading_cost_total": trade_cost,
+                "mfe": mfe,
+                "mae": mae,
+                "holding_bars": int(ex - en + 1),
                 "進場時間": str(entry_ts),
                 "出場時間": str(exit_ts),
                 "方向": "多" if side > 0 else "空",
                 "槓桿": round(lev, 2),
                 "進場價": entry_px,
                 "出場價": exit_px,
-                "價格報酬(方向)": px_ret,
+                "方向報酬(價格)": px_ret,
                 "策略報酬(含費用)": trade_ret,
-                "費用估計": trade_cost,
-                "MFE(最大有利)": mfe,
-                "MAE(最大不利)": mae,
+                "交易成本": trade_cost,
+                "MFE": mfe,
+                "MAE": mae,
                 "持倉K數": int(ex - en + 1),
             }
         )
@@ -87,7 +94,7 @@ def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
 def run_backtest(signal_df: pd.DataFrame, settings: Settings, interval: str | None = None) -> tuple[pd.DataFrame, dict]:
     df = signal_df.copy().sort_values("timestamp").reset_index(drop=True)
 
-    _interval = interval or getattr(settings, 'interval', '1h') or '1h'
+    _interval = interval or getattr(settings, "interval", "1h") or "1h"
     try:
         _bars_per_year = (365 * 24 * 3600) / max(1, interval_to_seconds(_interval))
     except Exception:
@@ -106,17 +113,16 @@ def run_backtest(signal_df: pd.DataFrame, settings: Settings, interval: str | No
     df["trading_cost"] = trading_cost
 
     try:
-        _funding_rate_8h = float(getattr(settings, 'funding_rate_8h_bps', 2.5) or 2.5) / 10_000
-        _interval_sec = max(1, interval_to_seconds(_interval))
-        _bars_per_8h = max(1.0, (8 * 3600) / _interval_sec)
-        funding_cost = df["position"].abs() * lev * (_funding_rate_8h / _bars_per_8h)
+        funding_rate_8h = float(getattr(settings, "funding_rate_8h_bps", 2.5) or 2.5) / 10_000
+        interval_sec = max(1, interval_to_seconds(_interval))
+        bars_per_8h = max(1.0, (8 * 3600) / interval_sec)
+        funding_cost = df["position"].abs() * lev * (funding_rate_8h / bars_per_8h)
     except Exception:
         funding_cost = pd.Series(0.0, index=df.index)
     df["funding_cost"] = funding_cost
 
     df["strategy_ret"] = (df["position_lev"] * df["bar_ret"]) - trading_cost - funding_cost
 
-    # Drawdown kill-switch
     equity = (1 + df["strategy_ret"]).cumprod()
     peak = equity.cummax()
     dd = equity / peak - 1
@@ -133,42 +139,40 @@ def run_backtest(signal_df: pd.DataFrame, settings: Settings, interval: str | No
     df["equity"] = equity
     df["drawdown_curve"] = dd
 
-    trade_mask = turnover > 0
-    realized = df.loc[trade_mask, "strategy_ret"]
+    trade_df = extract_trades(df)
+    realized = pd.to_numeric(trade_df.get("strategy_return", pd.Series(dtype=float)), errors="coerce").dropna()
     wins = realized[realized > 0]
     losses = realized[realized < 0]
 
-    gross_profit = wins.sum() if not wins.empty else 0.0
-    gross_loss = -losses.sum() if not losses.empty else 0.0
+    gross_profit = float(wins.sum()) if not wins.empty else 0.0
+    gross_loss = float(-losses.sum()) if not losses.empty else 0.0
 
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.nan
-    win_rate = (realized > 0).mean() if len(realized) else 0.0
-    avg_win = wins.mean() if len(wins) else 0.0
-    avg_loss = -losses.mean() if len(losses) else 0.0
+    win_rate = float((realized > 0).mean()) if len(realized) else 0.0
+    avg_win = float(wins.mean()) if len(wins) else 0.0
+    avg_loss = float(-losses.mean()) if len(losses) else 0.0
     pnl_ratio = avg_win / avg_loss if avg_loss > 0 else np.nan
 
-    total_return = equity.iloc[-1] - 1
-    # annual_factor computed dynamically above
+    total_return = float(equity.iloc[-1] - 1) if not equity.empty else 0.0
     sharpe = df["strategy_ret"].mean() / (df["strategy_ret"].std() + 1e-12) * annual_factor
 
     downside = df["strategy_ret"].copy()
     downside[downside > 0] = 0
     sortino = df["strategy_ret"].mean() / (downside.std() + 1e-12) * annual_factor
 
-    max_dd = float(dd.min())
-    calmar = (float(total_return) / abs(max_dd)) if max_dd < 0 else np.nan
+    max_dd = float(dd.min()) if not dd.empty else 0.0
+    calmar = (total_return / abs(max_dd)) if max_dd < 0 else np.nan
 
-    # Historical daily-ish VaR/ES on per-bar returns (approx, still useful).
     r = df["strategy_ret"].dropna().to_numpy()
     var_95 = float(np.quantile(r, 0.05)) if len(r) else 0.0
     es_95 = float(r[r <= var_95].mean()) if len(r[r <= var_95]) else var_95
 
     report = {
         "rows": int(len(df)),
-        "trades": int(len(realized)),
-        "total_return": float(total_return),
+        "trades": int(len(trade_df)),
+        "total_return": total_return,
         "max_drawdown": max_dd,
-        "win_rate": float(win_rate),
+        "win_rate": win_rate,
         "profit_factor": float(profit_factor) if not np.isnan(profit_factor) else None,
         "pnl_ratio": float(pnl_ratio) if not np.isnan(pnl_ratio) else None,
         "sharpe": float(sharpe),
@@ -178,6 +182,6 @@ def run_backtest(signal_df: pd.DataFrame, settings: Settings, interval: str | No
         "es_95": es_95,
         "avg_leverage": float(lev.mean()),
         "max_leverage_used": float(lev.max()),
-        "funding_rate_8h_bps": float(getattr(settings, 'funding_rate_8h_bps', 2.5) or 2.5),
+        "funding_rate_8h_bps": float(getattr(settings, "funding_rate_8h_bps", 2.5) or 2.5),
     }
     return df, report

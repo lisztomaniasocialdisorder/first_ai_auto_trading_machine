@@ -82,6 +82,98 @@ def _load_latest_signal_row(outputs_dir: Path, symbol: str, interval: str) -> di
     return df.iloc[-1].to_dict()
 
 
+def _signal_direction(sig: int) -> int:
+    if sig > 0:
+        return 1
+    if sig < 0:
+        return -1
+    return 0
+
+
+def _load_mtf_snapshot(outputs_dir: Path, symbol: str, intervals: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    snapshot: dict[str, dict[str, Any]] = {}
+    for tf in intervals:
+        try:
+            decision = _load_latest_decision(outputs_dir, symbol, tf)
+        except Exception:
+            decision = {}
+        try:
+            latest_row = _load_latest_signal_row(outputs_dir, symbol, tf)
+        except Exception:
+            latest_row = {}
+
+        sig_raw = decision.get("signal", latest_row.get("signal", 0))
+        lev_raw = decision.get("suggested_leverage", latest_row.get("suggested_leverage", 1.0))
+        price_raw = decision.get("price", latest_row.get("close", 0.0))
+        try:
+            sig = int(sig_raw or 0)
+        except Exception:
+            sig = 0
+        try:
+            suggested_lev = float(lev_raw or 1.0)
+        except Exception:
+            suggested_lev = 1.0
+        try:
+            price = float(price_raw or 0.0)
+        except Exception:
+            price = 0.0
+
+        snapshot[tf] = {
+            "decision": decision,
+            "row": latest_row,
+            "signal": sig,
+            "direction": _signal_direction(sig),
+            "suggested_leverage": suggested_lev,
+            "price": price,
+        }
+    return snapshot
+
+
+def _pick_mtf_consensus(snapshot: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    order = ("5m", "15m", "30m", "1h", "1d")
+    pairs = (
+        ("5m", "15m", 1),
+        ("15m", "30m", 2),
+        ("30m", "1h", 3),
+        ("1h", "1d", 4),
+    )
+    cap_by_tier = {1: 8, 2: 6, 3: 4, 4: 3}
+    candidates: list[dict[str, Any]] = []
+
+    for left, right, tier in pairs:
+        dl = int((snapshot.get(left) or {}).get("direction", 0) or 0)
+        dr = int((snapshot.get(right) or {}).get("direction", 0) or 0)
+        if dl != 0 and dl == dr:
+            candidates.append(
+                {
+                    "direction": dl,
+                    "tier": tier,
+                    "pair": (left, right),
+                    "leverage_cap": cap_by_tier.get(tier, 3),
+                }
+            )
+
+    if not candidates:
+        return {
+            "direction": 0,
+            "tier": 0,
+            "pair": None,
+            "leverage_cap": 1,
+            "note": "no adjacent timeframe consensus",
+        }
+
+    chosen = max(candidates, key=lambda item: int(item.get("tier", 0) or 0))
+    pair_left, pair_right = chosen["pair"]
+    direction_label = "long" if int(chosen["direction"]) > 0 else "short"
+    return {
+        "direction": int(chosen["direction"]),
+        "tier": int(chosen["tier"]),
+        "pair": chosen["pair"],
+        "leverage_cap": int(chosen["leverage_cap"]),
+        "note": f"mtf consensus: {pair_left}+{pair_right} => {direction_label}, leverage cap {int(chosen['leverage_cap'])}x",
+    }
+
+
 def _extract_usdt_balance(balance_resp: dict[str, Any]) -> float | None:
     data = balance_resp.get("data") or []
     if not data:
@@ -215,6 +307,8 @@ def execute_latest_signal_okx(
 
     decision = _load_latest_decision(outputs_dir, symbol, interval)
     latest_row = _load_latest_signal_row(outputs_dir, symbol, interval)
+    mtf_snapshot = _load_mtf_snapshot(outputs_dir, symbol, ("5m", "15m", "30m", "1h", "1d"))
+    mtf_gate = _pick_mtf_consensus(mtf_snapshot)
     sig = int(decision.get("signal", 0))
     suggested_lev = float(decision.get("suggested_leverage", 1.0))
     price = float(decision.get("price", 0.0) or latest_row.get("close", 0.0) or 0.0) or _load_latest_price(outputs_dir, symbol, interval)
@@ -258,7 +352,11 @@ def execute_latest_signal_okx(
     elif mode == "CLOSE":
         desired = 0
     else:
-        desired = 1 if sig > 0 else (-1 if sig < 0 else 0)
+        desired = int(mtf_gate.get("direction", 0) or 0)
+        if desired == 0:
+            risk_control_note = (risk_control_note + " | " if risk_control_note else "") + "mtf gate: no adjacent consensus"
+        else:
+            risk_control_note = (risk_control_note + " | " if risk_control_note else "") + str(mtf_gate.get("note", ""))
 
     # Auto risk regime from news/events:
     # - If panic rises (but not severe black swan hold), bias to defensive short.
@@ -271,6 +369,8 @@ def execute_latest_signal_okx(
         desired = 0
 
     lever = int(leverage_override or min(cfg.max_leverage, max(1, int(round(suggested_lev)))))
+    if mode == "AUTO" and desired != 0:
+        lever = min(lever, int(mtf_gate.get("leverage_cap", lever) or lever))
     if mode == "AUTO":
         if macro_event_risk_score > 0:
             # CPI/PPI/FOMC release windows: auto reduce risk.
@@ -474,5 +574,12 @@ def execute_latest_signal_okx(
             "market_panic_score": float(market_panic_score),
             "panic_regime": bool(panic_regime),
             "note": risk_control_note,
+            "mtf_gate": {
+                "direction": int(mtf_gate.get("direction", 0) or 0),
+                "tier": int(mtf_gate.get("tier", 0) or 0),
+                "pair": mtf_gate.get("pair"),
+                "leverage_cap": int(mtf_gate.get("leverage_cap", 1) or 1),
+                "note": mtf_gate.get("note", ""),
+            },
         },
     }

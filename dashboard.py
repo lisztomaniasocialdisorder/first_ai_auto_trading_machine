@@ -13,6 +13,7 @@ import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 
+from src.backtest import run_backtest
 from src.config import Settings
 from src.monitor import compute_drift_alerts, get_system_status
 from src.pipeline import run_pipeline, run_quick_update
@@ -20,6 +21,7 @@ from src.regime import add_regime_features
 from src.snr import compute_snr_levels, merge_multitimeframe_levels
 from src.paper_trade_okx import execute_latest_signal_okx
 from src.trade_journal import append_okx_order_record, load_okx_order_history
+from src.walkforward import run_walkforward_validation, save_walkforward_report
 from src.macro_events import generate_estimated_macro_events
 
 INTERVAL_TO_SECONDS = {
@@ -255,6 +257,107 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
     return bull[:4], bear[:4]
 
 
+週期資料門檻 = {
+    "5m": 200_000,
+    "15m": 80_000,
+    "30m": 70_000,
+    "1h": 40_000,
+    "1d": 3_000,
+}
+
+
+def _interval_seconds(interval: str) -> int:
+    return int(
+        {
+            "5m": 5 * 60,
+            "15m": 15 * 60,
+            "30m": 30 * 60,
+            "1h": 60 * 60,
+            "1d": 24 * 60 * 60,
+        }.get(interval, 60 * 60)
+    )
+
+
+def _expectancy_unit(win_rate: float, pnl_ratio: float) -> float:
+    """
+    Expectancy in loss-unit space.
+    > 0 means long-run positive expectancy.
+    """
+    w = max(0.0, min(1.0, float(win_rate)))
+    r = max(0.0, float(pnl_ratio))
+    return (w * r) - (1.0 - w)
+
+
+def _validation_thresholds(interval: str) -> dict[str, float]:
+    base_rows = int(週期資料門檻.get(interval, 40_000))
+    min_days = (base_rows * _interval_seconds(interval)) / 86400.0
+    base = {
+        "5m": {"min_days": min_days, "min_trades": 120, "min_rows": base_rows},
+        "15m": {"min_days": min_days, "min_trades": 100, "min_rows": base_rows},
+        "30m": {"min_days": min_days, "min_trades": 80, "min_rows": base_rows},
+        "1h": {"min_days": min_days, "min_trades": 60, "min_rows": base_rows},
+        "1d": {"min_days": min_days, "min_trades": 30, "min_rows": base_rows},
+    }
+    return base.get(interval, {"min_days": min_days, "min_trades": 60, "min_rows": base_rows})
+
+
+def _build_backtest_warnings(
+    interval: str,
+    sample_rows: int,
+    sample_days: float,
+    bt: dict,
+    wf_report: dict | None,
+) -> tuple[str, list[str]]:
+    limits = _validation_thresholds(interval)
+    warnings: list[str] = []
+    severity = "ok"
+
+    trades = int(bt.get("trades", 0) or 0)
+    if sample_rows < int(limits["min_rows"]):
+        warnings.append(f"回測K線數只有 {sample_rows:,} 根，低於建議的 {int(limits['min_rows']):,} 根。")
+        severity = "warning"
+    if sample_days < float(limits["min_days"]):
+        warnings.append(f"回測期間約 {sample_days:,.1f} 天，低於此週期建議的 {float(limits['min_days']):,.0f} 天。")
+        severity = "warning"
+    if trades < int(limits["min_trades"]):
+        warnings.append(f"交易筆數只有 {trades} 筆，低於建議的 {int(limits['min_trades'])} 筆。")
+        severity = "warning"
+
+    wr = float(bt.get("win_rate", 0.0) or 0.0)
+    rr = float(bt.get("pnl_ratio", 0.0) or 0.0)
+    exp_u = _expectancy_unit(wr, rr)
+    if exp_u <= 0:
+        warnings.append(f"主回測期望值 <= 0（勝率 {wr*100:.2f}%、盈虧比 {rr:.3f}、期望值 {exp_u:.4f}）。")
+        severity = "critical"
+
+    if wf_report:
+        summary = wf_report.get("summary", {}) if isinstance(wf_report.get("summary"), dict) else {}
+        positive_expectancy_folds = int(summary.get("positive_expectancy_folds", 0) or 0)
+        fold_count = int(wf_report.get("fold_count", 0) or 0)
+        avg_fold_expectancy = float(summary.get("average_fold_expectancy_unit", 0.0) or 0.0)
+        if fold_count > 0 and positive_expectancy_folds < max(1, fold_count // 2):
+            warnings.append(f"Walk-forward 只有 {positive_expectancy_folds}/{fold_count} 個 fold 為正期望值。")
+            severity = "critical"
+        if avg_fold_expectancy <= 0:
+            warnings.append(f"Walk-forward 平均期望值 <= 0（{avg_fold_expectancy:.4f}），代表泛化能力不足。")
+            severity = "critical"
+
+    if not warnings:
+        return "ok", ["樣本數、交易筆數與 walk-forward 目前都在可接受範圍內。"]
+    return severity, warnings
+
+
+def _is_walkforward_stale(wf_report: dict | None, current_rows: int, current_end_utc: str) -> bool:
+    if not wf_report:
+        return True
+    try:
+        src_rows = int(wf_report.get("source_rows", 0) or 0)
+    except Exception:
+        return True
+    src_end = str(wf_report.get("source_end_utc", "") or "")
+    return (src_rows != int(current_rows)) or (src_end != str(current_end_utc))
+
+
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -263,7 +366,7 @@ UI_PREFS_PATH = OUTPUT_DIR / "dashboard_user_prefs.json"
 BALANCE_AUTO_REFRESH_SEC = 30
 預設交易對 = "BTCUSDT"
 多週期清單 = ["5m", "15m", "30m", "1h", "1d"]
-每週期K線上限 = 5000
+每週期K線顯示保底 = 5000
 
 
 def _utc_now_iso() -> str:
@@ -436,7 +539,7 @@ def 回測顯示值(指標: str, value: object) -> object:
         v = float(value)
     except Exception:
         return value
-    if 指標 in {"勝率", "最大回撤"}:
+    if 指標 in {"總收益", "最大回撤", "勝率", "VaR 95%", "ES 95%"}:
         return f"{v * 100:.2f}%"
     return v
 
@@ -1003,6 +1106,7 @@ if not bool(st.session_state.get("_ui_prefs_loaded_once", False)):
     st.session_state["ui_symbol"] = str(_ui_prefs.get("symbol", 預設交易對))
     st.session_state["ui_interval"] = str(_ui_prefs.get("kline_interval", "1h"))
     st.session_state["ui_kline_count"] = _pref_int("kline_count", 300, min_value=100, max_value=2000)
+    st.session_state["ui_backtest_sample_rows"] = _pref_int("backtest_sample_rows", 0, min_value=0, max_value=2000000)
     st.session_state["ui_kline_auto_update_enabled"] = bool(_ui_prefs.get("kline_auto_update_enabled", False))
     st.session_state["ui_kline_auto_update_sec"] = _pref_int("kline_auto_update_sec", 15, min_value=5, max_value=3600)
     st.session_state["ui_max_train_rows"] = _pref_int("max_train_rows", 40000, min_value=0, max_value=2000000)
@@ -1021,6 +1125,7 @@ if st.session_state["_last_interval_selected"] != 週期:
     st.session_state["_sync_after_interval_switch"] = True
 槓桿上限 = 同步槓桿設定("槓桿上限", "槓桿上限 (1~100)", default=100)
 K線根數 = st.sidebar.slider("K線顯示根數", min_value=100, max_value=2000, step=50, key="ui_kline_count")
+回測樣本數 = st.sidebar.number_input("回測摘要樣本數 (0=全部可用)", min_value=0, max_value=2_000_000, step=500, key="ui_backtest_sample_rows")
 
 st.sidebar.divider()
 st.sidebar.markdown("### 🎯 風險偏好")
@@ -1053,7 +1158,8 @@ tag = f"{交易對}_{週期}"
 
 st.sidebar.divider()
 st.sidebar.markdown("### 🔄 資料更新")
-st.sidebar.caption("全週期執行（5m/15m/30m/1h/1d），每週期只保留最新 5000 根 K 線。")
+st.sidebar.caption("全週期執行（5m/15m/30m/1h/1d）。K 線圖顯示仍以輕量為主，但資料保留量會依訓練/回測樣本需求自動放大。")
+st.sidebar.caption("目前資料門檻：5m=200k、15m=80k、30m=70k、1h=40k、1d=3k")
 按鈕全量 = st.sidebar.button("全部週期抓資料+訓練", use_container_width=True)
 按鈕快速 = st.sidebar.button("全部週期快速更新", use_container_width=True)
 按鈕增量重訓 = st.sidebar.button("全部週期增量重訓", use_container_width=True)
@@ -1176,6 +1282,7 @@ _write_json_file(
         "symbol": str(st.session_state.get("ui_symbol", 預設交易對)),
         "kline_interval": str(st.session_state.get("ui_interval", "1h")),
         "kline_count": int(st.session_state.get("ui_kline_count", 300)),
+        "backtest_sample_rows": int(st.session_state.get("ui_backtest_sample_rows", 0)),
         "kline_auto_update_enabled": bool(st.session_state.get("ui_kline_auto_update_enabled", False)),
         "kline_auto_update_sec": int(st.session_state.get("ui_kline_auto_update_sec", 15)),
         "max_train_rows": int(st.session_state.get("ui_max_train_rows", 40000)),
@@ -1204,7 +1311,7 @@ def _run_okx(action: str) -> dict | None:
         try:
             if okx_sync_before_order:
                 try:
-                    os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
+                    os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(週期))
                     run_quick_update(symbol=交易對, interval=週期)
                 except Exception as e:
                     st.sidebar.warning(f"資料快速更新失敗：{e}")
@@ -1259,22 +1366,45 @@ def _run_okx(action: str) -> dict | None:
 
 
 # ── 按鈕動作 ────────────────────────────────────────────────────────────────
-def _prepare_data_train_env() -> int:
+def _prepare_data_train_env(interval: str | None = None) -> int:
     os.environ["TRAIN_DEVICE"] = "cloud"
     os.environ["NPU_STRICT"] = "0"
-    os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
     _user_limit = int(訓練最大樣本數)
-    _effective_train_rows = int(每週期K線上限 if _user_limit <= 0 else min(_user_limit, 每週期K線上限))
+    _backtest_limit = int(回測樣本數)
+    _effective_train_rows = int(max(0, _user_limit))
+    _target_interval = str(interval or 週期)
+    _floor_keep_rows = int(週期資料門檻.get(_target_interval, 每週期K線顯示保底))
+    _effective_keep_rows = max(
+        _floor_keep_rows,
+        int(_user_limit) if _user_limit > 0 else 0,
+        int(_backtest_limit) if _backtest_limit > 0 else 0,
+    )
+    os.environ["KLINE_KEEP_ROWS"] = str(_effective_keep_rows)
     os.environ["MAX_TRAIN_ROWS"] = str(_effective_train_rows)
     return _effective_train_rows
 
 
+def _resolve_keep_rows_for_runtime(interval: str | None = None) -> int:
+    _user_limit = int(訓練最大樣本數)
+    _backtest_limit = int(回測樣本數)
+    _target_interval = str(interval or 週期)
+    _floor_keep_rows = int(週期資料門檻.get(_target_interval, 每週期K線顯示保底))
+    return int(
+        max(
+            _floor_keep_rows,
+            int(_user_limit) if _user_limit > 0 else 0,
+            int(_backtest_limit) if _backtest_limit > 0 else 0,
+        )
+    )
+
+
 if 按鈕全量:
-    _train_cap = _prepare_data_train_env()
-    with st.spinner("正在更新全部週期資料並訓練（每週期最新 5000 根）..."):
+    _train_cap = _prepare_data_train_env(週期)
+    with st.spinner("正在更新全部週期資料並訓練（資料保留量會依訓練/回測樣本自動調整）..."):
         _failed: list[str] = []
         for _tf in 多週期清單:
             try:
+                _prepare_data_train_env(_tf)
                 run_pipeline(force_full_refresh=True, symbol=交易對, interval=_tf)
             except Exception as e:
                 _failed.append(f"{_tf}: {e}")
@@ -1284,11 +1414,12 @@ if 按鈕全量:
         st.success(f"全部週期完成（{', '.join(多週期清單)}），每週期訓練筆數上限：{_train_cap}")
 
 if 按鈕快速:
-    _prepare_data_train_env()
+    _prepare_data_train_env(週期)
     with st.spinner("快速更新全部週期中（只更新最新資料，不重訓）..."):
         _failed: list[str] = []
         for _tf in 多週期清單:
             try:
+                os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(_tf))
                 run_quick_update(symbol=交易對, interval=_tf)
             except FileNotFoundError:
                 _failed.append(f"{_tf}: 尚未有模型")
@@ -1300,7 +1431,7 @@ if 按鈕快速:
         st.success(f"快速更新完成（{', '.join(多週期清單)}）")
 
 if 按鈕增量重訓:
-    _train_cap = _prepare_data_train_env()
+    _train_cap = _prepare_data_train_env(週期)
     進度文字 = st.empty()
     進度條 = st.progress(0, text="準備開始...")
 
@@ -1317,6 +1448,7 @@ if 按鈕增量重訓:
             進度文字.info(f"目前進度：[{_tf_in}] {msg}")
 
         try:
+            _prepare_data_train_env(_tf)
             run_pipeline(force_full_refresh=False, progress_cb=回報進度, symbol=交易對, interval=_tf)
         except Exception as e:
             _failed.append(f"{_tf}: {e}")
@@ -1371,7 +1503,7 @@ if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全
     with st.sidebar:
         with st.spinner("已切換週期，正在同步..."):
             try:
-                os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
+                os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(週期))
                 run_quick_update(symbol=交易對, interval=週期)
                 st.success("週期切換同步完成")
             except FileNotFoundError:
@@ -1385,7 +1517,7 @@ if 即時更新啟用:
     上次更新 = float(st.session_state.get("kline_auto_last_update_ts", 0.0))
     if (目前時間 - 上次更新) >= int(即時更新秒數):
         try:
-            os.environ["KLINE_KEEP_ROWS"] = str(int(每週期K線上限))
+            os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(週期))
             run_quick_update(symbol=交易對, interval=週期)
             st.session_state["kline_auto_last_update_ts"] = 目前時間
             st.session_state["kline_auto_last_msg"] = f"K線即時更新成功：{time.strftime('%H:%M:%S')}"
@@ -1711,6 +1843,17 @@ st.markdown(
 )
 
 顯示區 = signals.tail(int(K線根數)).copy()
+回測樣本區 = signals.copy()
+if int(回測樣本數) > 0 and len(回測樣本區) > int(回測樣本數):
+    回測樣本區 = 回測樣本區.tail(int(回測樣本數)).reset_index(drop=True)
+目前回測曲線, 目前回測報告 = run_backtest(回測樣本區.copy(), 目前設定, interval=週期) if not 回測樣本區.empty else (pd.DataFrame(), {})
+回測起始 = _format_ts_dual(回測樣本區["timestamp"].iloc[0]) if not 回測樣本區.empty else ("N/A", "N/A")
+回測結束 = _format_ts_dual(回測樣本區["timestamp"].iloc[-1]) if not 回測樣本區.empty else ("N/A", "N/A")
+回測天數 = 0.0
+if not 回測樣本區.empty:
+    _bt_span = _to_utc_timestamp(回測樣本區["timestamp"].iloc[-1]) - _to_utc_timestamp(回測樣本區["timestamp"].iloc[0])
+    if pd.notna(_bt_span):
+        回測天數 = max(0.0, float(_bt_span.total_seconds()) / 86400.0)
 
 # ── K線圖 ─────────────────────────────────────────────────────────────────────
 fig_k = K線圖(顯示區)
@@ -1954,45 +2097,124 @@ with 分頁[6]:
                     st.metric("總盈虧(USDT)", "N/A")
 
 with 分頁[7]:
-    bt = report.get("backtest_report", {}) if report else {}
+    bt = 目前回測報告 if isinstance(目前回測報告, dict) else {}
+    _wf_report = _read_json_file(OUTPUT_DIR / f"walkforward_report_{tag}.json")
+    _wf_is_stale = _is_walkforward_stale(_wf_report, len(回測樣本區), str(回測樣本區["timestamp"].iloc[-1]) if not 回測樣本區.empty else "")
+    _wf_for_warning = None if _wf_is_stale else _wf_report
+    _bt_severity, _bt_warnings = _build_backtest_warnings(週期, len(回測樣本區), 回測天數, bt, _wf_for_warning)
     if not bt:
         st.info("尚未找到回測報告。")
     else:
-        items = [
-            ("總收益", 回測顯示值("總收益", bt.get("total_return"))),
-            ("最大回撤", 回測顯示值("最大回撤", bt.get("max_drawdown"))),
+        if _bt_severity == "critical":
+            st.error("回測可信度警告：" + " | ".join(_bt_warnings))
+        elif _bt_severity == "warning":
+            st.warning("回測可信度提醒：" + " | ".join(_bt_warnings))
+        else:
+            st.success(_bt_warnings[0])
+        st.caption("勝率 / 獲利因子 / 盈虧比 / 交易筆數使用逐筆交易口徑；Sharpe / Sortino / Calmar / VaR / ES 使用權益曲線逐 K 口徑。")
+        st.markdown(
+            f'<div class="subtle">回測樣本：{len(回測樣本區):,} 根 K 線 | 起點：{回測起始[1]} | 終點：{回測結束[1]} | 期間：約 {回測天數:,.1f} 天</div>',
+            unsafe_allow_html=True,
+        )
+        _tm = report.get("train_metrics", {}) if isinstance(report.get("train_metrics"), dict) else {}
+        _split_cols = st.columns(3)
+        _split_cards = [
+            ("訓練樣本", f"{int(_tm.get('train_rows', 0) or 0):,} 根", "模型實際訓練使用的樣本數"),
+            ("驗證樣本", f"{int(_tm.get('test_rows', 0) or 0):,} 根", "模型訓練時保留的樣本外驗證區"),
+            ("回測樣本", f"{len(回測樣本區):,} 根", "目前回測摘要使用的樣本數"),
+        ]
+        for _col, (_title, _value, _hint) in zip(_split_cols, _split_cards):
+            with _col:
+                st.markdown(
+                    f"""<div class="metric-card">
+                          <div class="metric-title">{_title}</div>
+                          <div class="metric-value">{_value}</div>
+                          <div class="subtle">{_hint}</div>
+                        </div>""",
+                    unsafe_allow_html=True,
+                )
+        trade_items = [
+            ("回測K線數", 回測顯示值("回測K線數", bt.get("rows"))),
+            ("交易筆數", 回測顯示值("交易筆數", bt.get("trades"))),
             ("勝率", 回測顯示值("勝率", bt.get("win_rate"))),
             ("獲利因子", 回測顯示值("獲利因子", bt.get("profit_factor"))),
             ("盈虧比", 回測顯示值("盈虧比", bt.get("pnl_ratio"))),
+            ("平均槓桿", 回測顯示值("平均槓桿", bt.get("avg_leverage"))),
+            ("最大使用槓桿", 回測顯示值("最大使用槓桿", bt.get("max_leverage_used"))),
+        ]
+        curve_items = [
+            ("總收益", 回測顯示值("總收益", bt.get("total_return"))),
+            ("最大回撤", 回測顯示值("最大回撤", bt.get("max_drawdown"))),
             ("Sharpe", 回測顯示值("Sharpe", bt.get("sharpe"))),
             ("Sortino", 回測顯示值("Sortino", bt.get("sortino"))),
             ("Calmar", 回測顯示值("Calmar", bt.get("calmar"))),
             ("VaR 95%", 回測顯示值("VaR 95%", bt.get("var_95"))),
             ("ES 95%", 回測顯示值("ES 95%", bt.get("es_95"))),
-            ("平均槓桿", 回測顯示值("平均槓桿", bt.get("avg_leverage"))),
-            ("最大使用槓桿", 回測顯示值("最大使用槓桿", bt.get("max_leverage_used"))),
         ]
-        sum_df = pd.DataFrame(items, columns=["指標", "數值"])
-        c_s1, c_s2 = st.columns([3, 2])
-        with c_s1:
-            summary_sort_col = st.selectbox("排序依據", options=["指標", "數值"], index=1)
-        with c_s2:
-            summary_desc = st.checkbox("降冪排序", value=True, key="summary_sort_desc")
-        if summary_sort_col == "數值":
-            sort_key = pd.to_numeric(
-                sum_df["數值"].astype(str).str.replace("%", "", regex=False), errors="coerce"
-            )
-            sum_df = (
-                sum_df.assign(_k=sort_key)
-                .sort_values("_k", ascending=not summary_desc, na_position="last")
-                .drop(columns="_k").reset_index(drop=True)
-            )
-        else:
-            sum_df = sum_df.sort_values("指標", ascending=not summary_desc).reset_index(drop=True)
-        _sum_safe = sum_df.copy()
-        for _c in _sum_safe.select_dtypes(include="object").columns:
-            _sum_safe[_c] = _sum_safe[_c].astype(str)
-        st.dataframe(_sum_safe, use_container_width=True, hide_index=True)
+        c_top1, c_top2 = st.columns(2)
+        with c_top1:
+            st.markdown("#### 交易級指標")
+            trade_df = pd.DataFrame(trade_items, columns=["指標", "數值"])
+            st.dataframe(_safe_df(trade_df), use_container_width=True, hide_index=True)
+        with c_top2:
+            st.markdown("#### 權益曲線指標")
+            curve_df = pd.DataFrame(curve_items, columns=["指標", "數值"])
+            st.dataframe(_safe_df(curve_df), use_container_width=True, hide_index=True)
+
+        st.markdown("#### Walk-Forward")
+        _wf_cols = st.columns([1.2, 2.8])
+        with _wf_cols[0]:
+            if st.button("重跑 Walk-Forward", use_container_width=True, key=f"wf_run_{tag}"):
+                try:
+                    with st.spinner("正在重跑 walk-forward 驗證..."):
+                        _wf_report = run_walkforward_validation(回測樣本區.copy(), 目前設定, n_folds=4)
+                        save_walkforward_report(_wf_report, OUTPUT_DIR, tag)
+                    st.success("Walk-forward 驗證已更新。")
+                except Exception as e:
+                    st.error(f"Walk-forward 失敗：{e}")
+        with _wf_cols[1]:
+            if _wf_is_stale:
+                st.info("目前的 walk-forward 報告是舊樣本版本，請按左側按鈕重跑後再判讀樣本外結果。")
+            elif _wf_report:
+                _wf_sum = _wf_report.get("summary", {})
+                st.markdown(
+                    f'<div class="subtle">來源樣本：{int(_wf_report.get("source_rows", 0)):,} 根 | fold 數：{int(_wf_report.get("fold_count", 0))} | 每 fold 測試：約 {int(_wf_report.get("test_rows_per_fold", 0)):,} 根</div>',
+                    unsafe_allow_html=True,
+                )
+                wf_items = [
+                    ("樣本外總收益", 回測顯示值("總收益", _wf_sum.get("compounded_total_return"))),
+                    ("平均 fold 收益", 回測顯示值("總收益", _wf_sum.get("average_fold_return"))),
+                    ("中位數 fold 收益", 回測顯示值("總收益", _wf_sum.get("median_fold_return"))),
+                    ("平均 fold 勝率", 回測顯示值("勝率", _wf_sum.get("average_fold_win_rate"))),
+                    ("平均 fold 盈虧比", 回測顯示值("盈虧比", _wf_sum.get("average_fold_pnl_ratio"))),
+                    ("平均 fold 期望值", 回測顯示值("期望值", _wf_sum.get("average_fold_expectancy_unit"))),
+                    ("平均 fold Sharpe", 回測顯示值("Sharpe", _wf_sum.get("average_fold_sharpe"))),
+                    ("最差 fold 回撤", 回測顯示值("最大回撤", -abs(float(_wf_sum.get("worst_fold_drawdown", 0.0) or 0.0)))),
+                    ("總樣本外交易筆數", int(_wf_sum.get("total_fold_trades", 0) or 0)),
+                    ("正期望 fold 數", f"{int(_wf_sum.get('positive_expectancy_folds', 0) or 0)}/{int(_wf_report.get('fold_count', 0) or 0)}"),
+                ]
+                st.dataframe(_safe_df(pd.DataFrame(wf_items, columns=["指標", "數值"])), use_container_width=True, hide_index=True)
+                _fold_rows = []
+                for _fold in _wf_report.get("folds", []):
+                    _b = _fold.get("backtest_report", {}) if isinstance(_fold.get("backtest_report"), dict) else {}
+                    _fold_rows.append(
+                        {
+                            "Fold": int(_fold.get("fold", 0) or 0),
+                            "TrainRows": int(_fold.get("train_rows", 0) or 0),
+                            "TestRows": int(_fold.get("test_rows", 0) or 0),
+                            "TestStart": _format_tw(_fold.get("test_start_utc")),
+                            "TestEnd": _format_tw(_fold.get("test_end_utc")),
+                            "TotalReturn": 回測顯示值("總收益", _b.get("total_return")),
+                            "WinRate": 回測顯示值("勝率", _b.get("win_rate")),
+                            "MaxDD": 回測顯示值("最大回撤", _b.get("max_drawdown")),
+                            "Sharpe": 回測顯示值("Sharpe", _b.get("sharpe")),
+                            "Trades": int(_b.get("trades", 0) or 0),
+                        }
+                    )
+                if _fold_rows:
+                    st.dataframe(_safe_df(pd.DataFrame(_fold_rows)), use_container_width=True, hide_index=True)
+            else:
+                st.info("尚未產生 walk-forward 報告。點左側按鈕即可開始。")
 
 # ── Teacher 蒸餾分頁 (index 8) ───────────────────────────────────────────────
 import plotly.graph_objects as _pgo
