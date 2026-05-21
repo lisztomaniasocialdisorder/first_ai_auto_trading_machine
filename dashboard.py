@@ -14,7 +14,9 @@ from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 
 from src.config import Settings
+from src.monitor import compute_drift_alerts, get_system_status
 from src.pipeline import run_pipeline, run_quick_update
+from src.regime import add_regime_features
 from src.snr import compute_snr_levels, merge_multitimeframe_levels
 from src.paper_trade_okx import execute_latest_signal_okx
 from src.trade_journal import append_okx_order_record, load_okx_order_history
@@ -389,6 +391,11 @@ def 讀取訊號資料() -> pd.DataFrame:
     else:
         df = _safe_read_csv(目前訊號檔)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    if "regime" not in df.columns:
+        try:
+            df = add_regime_features(df)
+        except Exception:
+            pass
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -1442,9 +1449,31 @@ if 推測週期秒數 > 0:
     最新收盤時間 = _to_utc_timestamp(最新["timestamp"]) + pd.Timedelta(seconds=推測週期秒數 - 1)
 最新收盤UTC, 最新收盤台北 = _format_ts_dual(最新收盤時間)
 
+目前設定 = Settings(symbol=交易對, interval=週期)
+
 # 訊號判斷（門檻由 AI 信心決定，不被用戶鎖定）
-_signal_threshold = Settings(symbol=交易對, interval=週期).get_signal_threshold()
+_signal_threshold = 目前設定.get_signal_threshold()
 訊號, 動作, 顏色類 = 判斷訊號(P看漲, P看跌, _signal_threshold)
+
+監控視窗 = min(len(signals), 168)
+if 推測週期秒數 > 0:
+    每週K線數 = max(48, int(round((7 * 24 * 3600) / 推測週期秒數)))
+    監控視窗 = min(len(signals), 每週K線數)
+if 監控視窗 < 48:
+    監控視窗 = min(len(signals), 48)
+drift_alerts = compute_drift_alerts(
+    signals,
+    window=max(1, 監控視窗),
+    confidence_floor=max(0.35, _signal_threshold - 0.03),
+)
+系統狀態圖示, 系統狀態文字 = get_system_status(drift_alerts)
+觸發警報 = [a.message for a in drift_alerts if a.triggered]
+regime_key = str(最新.get("regime", "ranging") or "ranging").lower()
+市場狀態 = {
+    "trend": "趨勢盤",
+    "volatile": "高波動",
+    "ranging": "盤整盤",
+}.get(regime_key, "未判定")
 
 # ── 自動交易邏輯 ─────────────────────────────────────────────────────────────
 if 自動交易啟用:
@@ -1572,6 +1601,27 @@ for col, (title, val, cls) in zip(頂部, metrics):
                 </div>""",
             unsafe_allow_html=True,
         )
+
+監控列 = st.columns([1.0, 1.6])
+with 監控列[0]:
+    st.markdown(
+        f"""<div class="metric-card">
+              <div class="metric-title">市場狀態</div>
+              <div class="metric-value">{市場狀態}</div>
+              <div class="subtle">目前週期：{週期} | 訊號門檻：{_signal_threshold:.2f}</div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
+with 監控列[1]:
+    _alert_text = " | ".join(觸發警報[:2]) if 觸發警報 else f"最近 {監控視窗} 根 K 線內未發現明顯漂移。"
+    st.markdown(
+        f"""<div class="metric-card">
+              <div class="metric-title">模型監控</div>
+              <div class="metric-value" style="font-size:1.45rem;">{系統狀態圖示} {系統狀態文字}</div>
+              <div class="subtle">{_alert_text}</div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
 
 控制列 = st.columns([1.35, 1.15])
 with 控制列[0]:

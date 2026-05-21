@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .regime import add_regime_features
+
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
@@ -89,6 +91,7 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     x["is_uptrend"] = (x["ma_20"] > x["ma_50"]).astype(int)
     x["is_downtrend"] = (x["ma_20"] < x["ma_50"]).astype(int)
 
+    x = add_regime_features(x)
     return x
 
 
