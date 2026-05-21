@@ -2,6 +2,10 @@
 
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 $port = 8600
 $url = "http://127.0.0.1:$port"

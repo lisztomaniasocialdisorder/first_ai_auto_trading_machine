@@ -28,7 +28,7 @@ if %ERRORLEVEL% EQU 0 (
   echo [INFO] Auto runner already running. Skip duplicate start.
 ) else (
   echo [INFO] Starting auto runner in background...
-  start "AI Auto Trading Runner" /MIN cmd /c "\"%PYTHON_EXE%\" -u \"%CD%\auto_trade_runner.py\" --symbol BTCUSDT --interval 1h >> \"%CD%\logs\auto_trading.log\" 2>&1"
+  start "AI Auto Trading Runner" /MIN cmd /c "\"%PYTHON_EXE%\" -X utf8 -u \"%CD%\auto_trade_runner.py\" --symbol BTCUSDT --interval 1h >> \"%CD%\logs\auto_trading.log\" 2>&1"
 )
 
 echo [INFO] Starting dashboard...
