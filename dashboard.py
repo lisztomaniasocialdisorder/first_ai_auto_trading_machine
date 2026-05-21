@@ -449,6 +449,28 @@ def 判斷訊號(p_long: float, p_short: float, 門檻: float) -> tuple[str, str
     return "觀望", "等待", "signal-flat"
 
 
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    color = hex_color.lstrip("#")
+    if len(color) != 6:
+        return f"rgba(255,255,255,{alpha:.2f})"
+    r = int(color[0:2], 16)
+    g = int(color[2:4], 16)
+    b = int(color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha:.2f})"
+
+
+def _snr_style(overlap_count: int, kind: str) -> tuple[str, float, str, int]:
+    """
+    S and non-S use different colors.
+    Overlap count controls opacity from 0.3 to 1.0 and line width from 1px to 4px.
+    """
+    count = max(1, min(4, int(overlap_count)))
+    opacity = 0.3 + ((count - 1) / 3.0) * 0.7
+    line_width = count
+    base_color = "#60a5fa" if kind == "S" else "#fb7185"
+    return base_color, opacity, _hex_to_rgba(base_color, max(0.18, opacity * 0.35)), line_width
+
+
 def K線圖(df: pd.DataFrame) -> go.Figure:
     x = df.copy().sort_values("timestamp").reset_index(drop=True)
     y_low = float(x["low"].min())
@@ -1709,13 +1731,14 @@ if 顯示SNR:
     merged = merge_multitimeframe_levels(all_levels, tolerance_abs=float(merge_tol))
     _x_end = 顯示區["timestamp"].iloc[-1]
     for lv in merged:
-        if len(lv.timeframes) < int(SNR重疊層數):
+        overlap_count = len(lv.timeframes)
+        if overlap_count < int(SNR重疊層數):
             continue
         tfs = ",".join(sorted(lv.timeframes,
                                key=lambda x: ["5m", "15m", "30m", "1h", "1d"].index(x)
                                if x in ["5m", "15m", "30m", "1h", "1d"] else 99))
         kind = "S" if (lv.kinds == {"S"}) else ("R" if (lv.kinds == {"R"}) else "S/R")
-        color = "#22c55e" if kind == "S" else ("#ef4444" if kind == "R" else "#a78bfa")
+        color, line_opacity, label_bg, line_width = _snr_style(overlap_count, kind)
         _touch = 顯示區[(顯示區["low"] <= float(lv.price)) & (顯示區["high"] >= float(lv.price))]
         if _touch.empty:
             continue
@@ -1728,20 +1751,20 @@ if 顯示SNR:
             x1=_x_end,
             y0=float(lv.price),
             y1=float(lv.price),
-            line=dict(color=color, width=1, dash="solid"),
-            opacity=0.75,
+            line=dict(color=color, width=line_width, dash="solid"),
+            opacity=line_opacity,
         )
         fig_k.add_annotation(
             x=_x_end,
             y=float(lv.price),
             xref="x",
             yref="y",
-            text=f"{kind} {tfs}",
+            text=f"{kind} x{overlap_count} {tfs}",
             showarrow=False,
             xanchor="left",
             xshift=6,
             font=dict(color=color, size=11),
-            bgcolor="rgba(15,23,42,0.65)",
+            bgcolor=label_bg,
         )
 
 st.plotly_chart(
