@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
+import uuid
 
 import pandas as pd
 
@@ -60,6 +61,23 @@ def _read_json(path: Path) -> dict | None:
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _safe_read_csv(path: Path, **kwargs) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, **kwargs)
+    except pd.errors.ParserError:
+        fallback = dict(kwargs)
+        fallback.setdefault("engine", "python")
+        fallback.setdefault("on_bad_lines", "skip")
+        return pd.read_csv(path, **fallback)
+
+
+def _atomic_write_csv(df: pd.DataFrame, target: Path, **kwargs) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    df.to_csv(tmp, **kwargs)
+    tmp.replace(target)
 
 
 def _copy_model_tree(src: Path, dst: Path) -> None:
@@ -238,21 +256,21 @@ def _write_outputs(
         results["data_health"] = data_health
 
     tag = f"{settings.symbol}_{settings.interval}"
-    bt_curve.to_csv(settings.output_dir / f"backtest_curve_{tag}.csv", index=False)
-    inferred.to_csv(settings.output_dir / f"signals_with_features_{tag}.csv", index=False)
+    _atomic_write_csv(bt_curve, settings.output_dir / f"backtest_curve_{tag}.csv", index=False)
+    _atomic_write_csv(inferred, settings.output_dir / f"signals_with_features_{tag}.csv", index=False)
     with open(settings.output_dir / f"report_{tag}.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     trades = extract_trades(bt_curve)
-    trades.to_csv(settings.output_dir / f"trades_{tag}.csv", index=False, encoding="utf-8")
+    _atomic_write_csv(trades, settings.output_dir / f"trades_{tag}.csv", index=False, encoding="utf-8")
 
     # Backward-compat: keep updating the legacy filenames to the latest run,
     # so older UI/exe that expects fixed paths still works.
-    bt_curve.to_csv(settings.output_dir / "backtest_curve.csv", index=False)
-    inferred.to_csv(settings.output_dir / "signals_with_features.csv", index=False)
+    _atomic_write_csv(bt_curve, settings.output_dir / "backtest_curve.csv", index=False)
+    _atomic_write_csv(inferred, settings.output_dir / "signals_with_features.csv", index=False)
     with open(settings.output_dir / "report.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    trades.to_csv(settings.output_dir / "trades.csv", index=False, encoding="utf-8")
+    _atomic_write_csv(trades, settings.output_dir / "trades.csv", index=False, encoding="utf-8")
     return results
 
 
@@ -296,7 +314,7 @@ def run_pipeline(
     distill_alpha = 0.4
     if soft_label_path.exists():
         try:
-            soft_labels_df = pd.read_csv(soft_label_path)
+            soft_labels_df = _safe_read_csv(soft_label_path)
             if progress_cb:
                 progress_cb(66, f"偵測到 Teacher 軟標籤（{len(soft_labels_df):,} 筆），啟用蒸餾訓練（alpha={distill_alpha}）")
         except Exception as _e:

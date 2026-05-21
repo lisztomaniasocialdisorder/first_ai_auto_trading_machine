@@ -215,6 +215,11 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
     vol24 = float(row.get("realized_vol_24", 0.03) or 0.03)
     atr_pct = float(row.get("atr_pct", 0.015) or 0.015)
     drawdown = float(row.get("drawdown", 0.0) or 0.0)
+    snr_break_s = int(pd.to_numeric(row.get("snr_break_support_count", 0), errors="coerce") or 0)
+    snr_break_r = int(pd.to_numeric(row.get("snr_break_resistance_count", 0), errors="coerce") or 0)
+    snr_ov_s = int(pd.to_numeric(row.get("snr_overlap_support_count", 0), errors="coerce") or 0)
+    snr_ov_r = int(pd.to_numeric(row.get("snr_overlap_resistance_count", 0), errors="coerce") or 0)
+    block_reason = str(row.get("trade_block_reason", "") or "").strip()
 
     bull: list[str] = []
     bear: list[str] = []
@@ -248,6 +253,17 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
 
     if drawdown <= -0.10:
         bear.append("近期回撤偏深，模型風控會傾向保守。")
+
+    if snr_break_s >= 2:
+        bear.append(f"SNR 支撐摜破偏強（{snr_break_s} 層），短線偏空。")
+    if snr_break_r >= 2:
+        bull.append(f"SNR 壓力突破偏強（{snr_break_r} 層），短線偏多。")
+    if snr_ov_s >= 2:
+        bull.append(f"下方有 {snr_ov_s} 層支撐重疊，存在承接機會。")
+    if snr_ov_r >= 2:
+        bear.append(f"上方有 {snr_ov_r} 層壓力重疊，突破難度偏高。")
+    if block_reason:
+        bear.append(f"目前被風控擋單：{block_reason}。")
 
     if not bull:
         bull.append("目前偏多依據不足，需等待更明確的突破訊號。")
@@ -493,7 +509,10 @@ def 讀取訊號資料() -> pd.DataFrame:
             return pd.DataFrame()
     else:
         df = _safe_read_csv(目前訊號檔)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df[df["timestamp"].notna()].copy()
+    if df.empty:
+        return df
     if "regime" not in df.columns:
         try:
             df = add_regime_features(df)
@@ -557,7 +576,7 @@ def _latest_timestamp_from_csv(path: Path) -> pd.Timestamp | None:
     if not path.exists():
         return None
     try:
-        df = pd.read_csv(path, usecols=["timestamp"])
+        df = _safe_read_csv(path, usecols=["timestamp"])
         if df.empty:
             return None
         ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True, errors="coerce")
@@ -1128,14 +1147,200 @@ def _嘗試載入週期資料(symbol: str, interval: str) -> pd.DataFrame | None
     p_outputs = OUTPUT_DIR / f"signals_with_features_{tag2}.csv"
     p_raw = BASE_DIR / "data" / f"{symbol}_{interval}_ohlcv.csv"
     if p_outputs.exists():
-        d = pd.read_csv(p_outputs)
+        d = _safe_read_csv(p_outputs)
     elif p_raw.exists():
-        d = pd.read_csv(p_raw)
+        d = _safe_read_csv(p_raw)
     else:
         return None
+    if d.empty or "timestamp" not in d.columns:
+        return None
     if "timestamp" in d.columns:
-        d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+        ts = pd.to_datetime(d["timestamp"], utc=True, errors="coerce")
+    elif "open_time" in d.columns:
+        ts = pd.to_datetime(pd.to_numeric(d["open_time"], errors="coerce"), unit="ms", utc=True, errors="coerce")
+    else:
+        return None
+    d["timestamp"] = ts
+    d = d[d["timestamp"].notna()].copy()
+    if d.empty:
+        return None
     return d.sort_values("timestamp").reset_index(drop=True)
+
+
+def _build_fallback_signals_from_raw(symbol: str, interval: str, keep_rows: int = 5000) -> pd.DataFrame:
+    raw_path = BASE_DIR / "data" / f"{symbol}_{interval}_ohlcv.csv"
+    if not raw_path.exists():
+        return pd.DataFrame()
+    raw = _safe_read_csv(raw_path)
+    if raw.empty:
+        return pd.DataFrame()
+    if "timestamp" in raw.columns:
+        raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+    elif "open_time" in raw.columns:
+        raw["timestamp"] = pd.to_datetime(pd.to_numeric(raw["open_time"], errors="coerce"), unit="ms", utc=True, errors="coerce")
+    else:
+        return pd.DataFrame()
+    raw = raw[raw["timestamp"].notna()].sort_values("timestamp").tail(int(max(500, keep_rows))).reset_index(drop=True)
+    if raw.empty:
+        return pd.DataFrame()
+
+    try:
+        from src.features import add_technical_features as _add_tech
+        x = _add_tech(raw.copy())
+    except Exception:
+        x = raw.copy()
+
+    defaults_num = {
+        "p_long": 0.33,
+        "p_short": 0.33,
+        "p_flat": 0.34,
+        "signal": 0.0,
+        "suggested_leverage": 1.0,
+        "max_safe_leverage": 1.0,
+        "confidence_index": 0.0,
+        "atr_pct": 0.015,
+        "realized_vol_24": 0.03,
+        "fear_greed_value": 50.0,
+        "macd_hist": 0.0,
+        "macd": 0.0,
+        "macd_signal": 0.0,
+        "rsi_14": 50.0,
+        "drawdown": 0.0,
+        "rolling_high_24": pd.to_numeric(x.get("high"), errors="coerce"),
+        "rolling_low_24": pd.to_numeric(x.get("low"), errors="coerce"),
+        "plus_di": 0.0,
+        "minus_di": 0.0,
+        "trade_allowed": 0.0,
+    }
+    for k, v in defaults_num.items():
+        if k not in x.columns:
+            x[k] = v
+    if "trade_block_reason" not in x.columns:
+        x["trade_block_reason"] = "fallback raw data mode"
+    if "regime" not in x.columns:
+        x["regime"] = "ranging"
+    x["signal"] = pd.to_numeric(x["signal"], errors="coerce").fillna(0).astype(int)
+    x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
+    x = x[x["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
+    return x
+
+
+def _collect_mtf_overlap(symbol: str, intervals: list[str]) -> dict[str, object]:
+    bull: list[str] = []
+    bear: list[str] = []
+    flat: list[str] = []
+    for tf in intervals:
+        sig_val = None
+        rpt = OUTPUT_DIR / f"report_{symbol}_{tf}.json"
+        if rpt.exists():
+            try:
+                payload = json.loads(rpt.read_text(encoding="utf-8"))
+                latest = payload.get("latest_decision", {}) if isinstance(payload, dict) else {}
+                sig_val = int(latest.get("signal", 0))
+            except Exception:
+                sig_val = None
+        if sig_val is None:
+            p = OUTPUT_DIR / f"signals_with_features_{symbol}_{tf}.csv"
+            if p.exists():
+                try:
+                    d = _safe_read_csv(p)
+                    if not d.empty and "signal" in d.columns:
+                        sig_val = int(pd.to_numeric(d["signal"], errors="coerce").fillna(0).iloc[-1])
+                except Exception:
+                    sig_val = None
+        if sig_val == 1:
+            bull.append(tf)
+        elif sig_val == -1:
+            bear.append(tf)
+        else:
+            flat.append(tf)
+    return {
+        "bull_count": len(bull),
+        "bear_count": len(bear),
+        "flat_count": len(flat),
+        "bull_tfs": bull,
+        "bear_tfs": bear,
+        "flat_tfs": flat,
+    }
+
+
+def _render_kline_with_snr(
+    display_df: pd.DataFrame,
+    price_ref: float,
+    symbol: str,
+    interval: str,
+    show_snr: bool,
+    snr_intervals: list[str],
+    snr_overlap_min: int,
+    snr_max_levels: int,
+    plotly_cfg: dict,
+) -> None:
+    if display_df.empty:
+        st.info("目前沒有可顯示的 K 線資料。")
+        return
+    fig_k = K線圖(display_df)
+    if show_snr:
+        all_levels = []
+        atr_proxy = float(display_df["atr_14"].dropna().tail(100).median()) if "atr_14" in display_df.columns else (price_ref * 0.002)
+        merge_tol = max(atr_proxy * 0.6, price_ref * 0.0008)
+        for tf in snr_intervals:
+            src = display_df if tf == interval else _嘗試載入週期資料(symbol, tf)
+            if src is None or src.empty:
+                continue
+            needed = [
+                c
+                for c in [
+                    "timestamp", "open", "high", "low", "close", "volume",
+                    "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote",
+                ]
+                if c in src.columns
+            ]
+            src2 = src[needed].copy()
+            lv = compute_snr_levels(src2, timeframe=tf, lookback_bars=800, pivot_window=5, max_levels=int(snr_max_levels))
+            all_levels.extend(lv)
+        merged = merge_multitimeframe_levels(all_levels, tolerance_abs=float(merge_tol))
+        x_end = display_df["timestamp"].iloc[-1]
+        for lv in merged:
+            overlap_count = len(lv.timeframes)
+            if overlap_count < int(snr_overlap_min):
+                continue
+            tfs = ",".join(
+                sorted(
+                    lv.timeframes,
+                    key=lambda x: ["5m", "15m", "30m", "1h", "1d"].index(x) if x in ["5m", "15m", "30m", "1h", "1d"] else 99,
+                )
+            )
+            kind = "S" if (lv.kinds == {"S"}) else ("R" if (lv.kinds == {"R"}) else "S/R")
+            color, line_opacity, label_bg, line_width = _snr_style(overlap_count, kind)
+            touch = display_df[(display_df["low"] <= float(lv.price)) & (display_df["high"] >= float(lv.price))]
+            if touch.empty:
+                continue
+            x_start = touch["timestamp"].iloc[0]
+            fig_k.add_shape(
+                type="line",
+                xref="x",
+                yref="y",
+                x0=x_start,
+                x1=x_end,
+                y0=float(lv.price),
+                y1=float(lv.price),
+                line=dict(color=color, width=line_width, dash="solid"),
+                opacity=line_opacity,
+            )
+            fig_k.add_annotation(
+                x=x_end,
+                y=float(lv.price),
+                xref="x",
+                yref="y",
+                text=f"{kind} x{overlap_count} {tfs}",
+                showarrow=False,
+                xanchor="left",
+                xshift=6,
+                font=dict(color=color, size=11),
+                bgcolor=label_bg,
+            )
+
+    st.plotly_chart(fig_k, use_container_width=True, config=plotly_cfg)
 
 
 # ═══════════════════ SIDEBAR ═══════════════════════════════════════════════
@@ -1265,6 +1470,15 @@ _teacher_n_rf = st.sidebar.select_slider(
 )
 按鈕訓練Teacher = st.sidebar.button(
     "🧑‍🏫 訓練 Teacher 模型", use_container_width=True, key="btn_train_teacher"
+)
+_teacher_full_flow = st.sidebar.checkbox(
+    "Teacher 前先抓歷史+線上特徵，並自動重訓本地 Student",
+    value=True,
+    key="teacher_full_flow",
+    help="勾選後會執行：全量抓歷史資料(含線上事件特徵) → 訓練 Teacher → 以軟標籤重訓本地小模型。",
+)
+按鈕Teacher全流程 = st.sidebar.button(
+    "🌐 Teacher 全流程（抓歷史→蒸餾→本地AI）", use_container_width=True, key="btn_teacher_full_flow"
 )
 from src.distillation import teacher_exists, load_teacher_report
 _teacher_model_dir = BASE_DIR / "models"
@@ -1463,6 +1677,27 @@ def _resolve_keep_rows_for_runtime(interval: str | None = None) -> int:
     )
 
 
+def _prepare_teacher_online_data_env(interval: str | None = None) -> None:
+    _target_interval = str(interval or 週期)
+    os.environ["TRAIN_DEVICE"] = "cloud"
+    os.environ["NPU_STRICT"] = "0"
+    # Force enough historical bars for each timeframe before teacher fitting.
+    os.environ["KLINE_KEEP_ROWS"] = str(int(週期資料門檻.get(_target_interval, 每週期K線顯示保底)))
+    # Let preprocessing/training use all available rows for teacher-source data generation.
+    os.environ["MAX_TRAIN_ROWS"] = "0"
+
+
+def _prepare_local_student_env(interval: str | None = None) -> int:
+    _target_interval = str(interval or 週期)
+    _user_limit = int(訓練最大樣本數)
+    _effective_train_rows = int(max(0, _user_limit))
+    os.environ["TRAIN_DEVICE"] = "cpu"
+    os.environ["NPU_STRICT"] = "0"
+    os.environ["MAX_TRAIN_ROWS"] = str(_effective_train_rows)
+    os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(_target_interval))
+    return _effective_train_rows
+
+
 if 按鈕全量:
     _train_cap = _prepare_data_train_env(週期)
     with st.spinner("正在更新全部週期資料並訓練（資料保留量會依訓練/回測樣本自動調整）..."):
@@ -1525,46 +1760,71 @@ if 按鈕增量重訓:
         st.success(f"增量更新 + 重訓回測完成（全部週期），每週期訓練筆數上限：{_train_cap}")
 
 # ── Teacher 蒸餾訓練 ──────────────────────────────────────────────────
-if 按鈕訓練Teacher:
-    if not _teacher_csv.exists():
-        st.error(f"找不到訊號檔：{_teacher_csv.name}，請先執行「增量更新+重訓回測」產生資料。")
-    else:
-        from src.distillation import train_teacher as _train_teacher
-        _t_進度文字 = st.empty()
-        _t_進度條 = st.progress(0, text="Teacher 訓練準備中...")
+if 按鈕訓練Teacher or 按鈕Teacher全流程:
+    from src.distillation import train_teacher as _train_teacher
+    _run_teacher_full_flow = bool(按鈕Teacher全流程 or _teacher_full_flow)
+    _t_進度文字 = st.empty()
+    _t_進度條 = st.progress(0, text="Teacher 流程準備中...")
 
-        def _teacher_cb(p: int, msg: str) -> None:
-            _p = max(0, min(100, int(p)))
-            _t_進度條.progress(_p, text=f"{msg} ({_p}%)")
-            _t_進度文字.info(f"🧑‍🏫 Teacher：{msg}")
+    def _set_overall(p: int, msg: str) -> None:
+        _p = max(0, min(100, int(p)))
+        _t_進度條.progress(_p, text=f"{msg} ({_p}%)")
+        _t_進度文字.info(msg)
 
-        with st.spinner("訓練 Teacher 集成模型中（RF×500 + GradientBoosting），請稍候..."):
-            try:
-                _t_rpt = _train_teacher(
-                    csv_path=_teacher_csv,
-                    model_dir=BASE_DIR / "models",
-                    output_dir=OUTPUT_DIR,
-                    symbol=交易對,
-                    interval=週期,
-                    max_rows=int(_teacher_max_rows),
-                    temperature=float(_teacher_temperature),
-                    n_rf_estimators=int(_teacher_n_rf),
-                    gb_n_estimators=200,
-                    progress_cb=_teacher_cb,
-                )
-                _t_進度條.progress(100, text="Teacher 訓練完成！(100%)")
-                _stats = _t_rpt.get("soft_label_stats", {})
-                st.success(
-                    f"✅ Teacher 訓練完成！平均信心："
-                    f"{_stats.get('mean_teacher_confidence', 0)*100:.1f}%  |  "
-                    f"平均槓桿：{_stats.get('mean_teacher_leverage', 0):.2f}×  |  "
-                    f"槓桿 MAE：{_t_rpt.get('leverage_mae', 0):.4f}"
-                )
-                st.session_state["teacher_report_cache"] = _t_rpt
-            except Exception as _e:
-                st.error(f"Teacher 訓練失敗：{_e}")
+    def _teacher_cb(p: int, msg: str) -> None:
+        # Teacher stage maps to 45~80
+        _p = max(0, min(100, int(45 + (int(p) * 35 / 100))))
+        _set_overall(_p, f"🧑‍🏫 Teacher：{msg}")
 
-if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全量 or 按鈕快速 or 按鈕增量重訓):
+    try:
+        if _run_teacher_full_flow:
+            _set_overall(5, "🌐 步驟 1/3：抓歷史資料並同步線上特徵...")
+            _prepare_teacher_online_data_env(週期)
+            run_pipeline(force_full_refresh=True, symbol=交易對, interval=週期)
+            _set_overall(40, "✅ 歷史資料與線上特徵同步完成")
+
+        if not _teacher_csv.exists():
+            raise FileNotFoundError(f"找不到訊號檔：{_teacher_csv.name}，請先執行資料更新。")
+
+        _set_overall(45, "🧑‍🏫 步驟 2/3：訓練 Teacher 並輸出軟標籤...")
+        _t_rpt = _train_teacher(
+            csv_path=_teacher_csv,
+            model_dir=BASE_DIR / "models",
+            output_dir=OUTPUT_DIR,
+            symbol=交易對,
+            interval=週期,
+            max_rows=int(_teacher_max_rows),
+            temperature=float(_teacher_temperature),
+            n_rf_estimators=int(_teacher_n_rf),
+            gb_n_estimators=200,
+            progress_cb=_teacher_cb,
+        )
+        st.session_state["teacher_report_cache"] = _t_rpt
+
+        if _run_teacher_full_flow:
+            _set_overall(82, "🧠 步驟 3/3：用 Teacher 軟標籤重訓本地小模型...")
+            _local_train_cap = _prepare_local_student_env(週期)
+            run_pipeline(force_full_refresh=False, symbol=交易對, interval=週期)
+            _set_overall(100, "✅ 全流程完成：Teacher + 本地 Student")
+            _stats = _t_rpt.get("soft_label_stats", {})
+            st.success(
+                f"✅ Teacher 全流程完成！平均信心：{_stats.get('mean_teacher_confidence', 0)*100:.1f}%"
+                f" | 平均槓桿：{_stats.get('mean_teacher_leverage', 0):.2f}×"
+                f" | 本地 Student 上限樣本數：{_local_train_cap}"
+            )
+        else:
+            _set_overall(100, "✅ Teacher 訓練完成")
+            _stats = _t_rpt.get("soft_label_stats", {})
+            st.success(
+                f"✅ Teacher 訓練完成！平均信心："
+                f"{_stats.get('mean_teacher_confidence', 0)*100:.1f}%  |  "
+                f"平均槓桿：{_stats.get('mean_teacher_leverage', 0):.2f}×  |  "
+                f"槓桿 MAE：{_t_rpt.get('leverage_mae', 0):.4f}"
+            )
+    except Exception as _e:
+        st.error(f"Teacher 流程失敗：{_e}")
+
+if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全量 or 按鈕快速 or 按鈕增量重訓 or 按鈕訓練Teacher or 按鈕Teacher全流程):
     with st.sidebar:
         with st.spinner("已切換週期，正在同步..."):
             try:
@@ -1578,7 +1838,10 @@ if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全
     st.session_state["_sync_after_interval_switch"] = False
 
 目前時間 = time.time()
-if 即時更新啟用:
+_fragment_api = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+_use_fragment_live_update = bool(即時更新啟用 and (_fragment_api is not None))
+_use_auto_trade_fragment = bool(自動交易啟用 and (_fragment_api is not None))
+if 即時更新啟用 and not _use_fragment_live_update:
     上次更新 = float(st.session_state.get("kline_auto_last_update_ts", 0.0))
     if (目前時間 - 上次更新) >= int(即時更新秒數):
         try:
@@ -1598,21 +1861,87 @@ report = 讀取報告()
 trades_df = 讀取交易明細(交易對, 週期)
 資料健康 = _build_data_health_snapshot(交易對, 週期, signals, report)
 
+# Keep a per-symbol/interval cache so transient read failures do not blank the UI.
+_sig_cache_key = f"signals_cache_{交易對}_{週期}"
+_report_cache_key = f"report_cache_{交易對}_{週期}"
+_trades_cache_key = f"trades_cache_{交易對}_{週期}"
+_sig_disk_cache = OUTPUT_DIR / f"_ui_cache_signals_{交易對}_{週期}.csv"
+_report_disk_cache = OUTPUT_DIR / f"_ui_cache_report_{交易對}_{週期}.json"
+_trades_disk_cache = OUTPUT_DIR / f"_ui_cache_trades_{交易對}_{週期}.csv"
+if not signals.empty:
+    st.session_state[_sig_cache_key] = signals
+    try:
+        signals.to_csv(_sig_disk_cache, index=False)
+    except Exception:
+        pass
+else:
+    _cached_signals = st.session_state.get(_sig_cache_key)
+    if isinstance(_cached_signals, pd.DataFrame) and not _cached_signals.empty:
+        signals = _cached_signals.copy()
+        st.warning("偵測到本次訊號檔暫時不可讀，已自動回退到上一版快取資料。")
+    elif _sig_disk_cache.exists():
+        try:
+            _disk = _safe_read_csv(_sig_disk_cache)
+            if not _disk.empty and "timestamp" in _disk.columns:
+                _disk["timestamp"] = pd.to_datetime(_disk["timestamp"], utc=True, errors="coerce")
+                _disk = _disk[_disk["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
+                if not _disk.empty:
+                    signals = _disk
+                    st.warning("偵測到本次訊號檔暫時不可讀，已自動回退到磁碟快取資料。")
+        except Exception:
+            pass
+if isinstance(report, dict) and report:
+    st.session_state[_report_cache_key] = report
+    try:
+        _report_disk_cache.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+else:
+    _cached_report = st.session_state.get(_report_cache_key)
+    if isinstance(_cached_report, dict) and _cached_report:
+        report = dict(_cached_report)
+    elif _report_disk_cache.exists():
+        try:
+            report = json.loads(_report_disk_cache.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+    st.session_state[_trades_cache_key] = trades_df
+    try:
+        trades_df.to_csv(_trades_disk_cache, index=False)
+    except Exception:
+        pass
+else:
+    _cached_trades = st.session_state.get(_trades_cache_key)
+    if isinstance(_cached_trades, pd.DataFrame) and not _cached_trades.empty:
+        trades_df = _cached_trades.copy()
+    elif _trades_disk_cache.exists():
+        try:
+            trades_df = _safe_read_csv(_trades_disk_cache)
+        except Exception:
+            pass
+
 if signals.empty:
     raw_path = BASE_DIR / "data" / f"{交易對}_{週期}_ohlcv.csv"
     raw_last = "未知"
     if raw_path.exists():
         try:
-            raw_last = str(pd.read_csv(raw_path, usecols=["timestamp"])["timestamp"].iloc[-1])
+            raw_last = str(_safe_read_csv(raw_path, usecols=["timestamp"])["timestamp"].iloc[-1])
         except Exception:
             raw_last = "讀取失敗"
-    raw_last_utc, raw_last_tw = _format_ts_dual(raw_last)
-    st.warning(
-        f"目前沒有此週期的模型訊號檔：`{目前訊號檔.name}`。\n\n"
-        f"原始K線檔最新開盤時間：`{raw_last_utc}`（台北：`{raw_last_tw}`）。\n\n"
-        "請先按左側「增量更新+重訓回測」建立該週期訊號後再顯示模型結果。"
-    )
-    st.stop()
+    _fallback = _build_fallback_signals_from_raw(交易對, 週期, keep_rows=max(1000, int(K線根數)))
+    if not _fallback.empty:
+        signals = _fallback
+        資料健康 = _build_data_health_snapshot(交易對, 週期, signals, report)
+        st.warning("本次刷新期間訊號檔暫時不可讀，已切換成原始K線降級顯示（不中斷畫面）。")
+    else:
+        raw_last_utc, raw_last_tw = _format_ts_dual(raw_last)
+        st.warning(
+            f"目前沒有此週期的模型訊號檔：`{目前訊號檔.name}`。\n\n"
+            f"原始K線檔最新開盤時間：`{raw_last_utc}`（台北：`{raw_last_tw}`）。\n\n"
+            "請先按左側「增量更新+重訓回測」建立該週期訊號後再顯示模型結果。"
+        )
+        st.stop()
 
 if 資料健康.get("is_stale", False):
     _latest_ts = 資料健康.get("latest_ts")
@@ -1702,13 +2031,14 @@ regime_key = str(最新.get("regime", "ranging") or "ranging").lower()
     "volatile": "高波動",
     "ranging": "盤整盤",
 }.get(regime_key, "未判定")
+多週期共振 = _collect_mtf_overlap(交易對, ["5m", "15m", "30m", "1h", "1d"])
 
 _data_latest = 資料健康.get("latest_ts") or 最新["timestamp"]
 _data_age_hours = float(資料健康.get("age_seconds", 0.0) or 0.0) / 3600.0 if 資料健康.get("age_seconds") is not None else None
 _data_status = "過期" if 資料健康.get("is_stale", False) else "正常"
 
 # ── 自動交易邏輯 ─────────────────────────────────────────────────────────────
-if 自動交易啟用:
+if 自動交易啟用 and not _use_auto_trade_fragment:
     if not okx_enable:
         st.sidebar.warning("已開啟純AI自動交易，但目前未允許下單。請勾選『允許送出模擬盤下單』。")
     else:
@@ -1874,6 +2204,14 @@ st.markdown(
         </div>""",
     unsafe_allow_html=True,
 )
+st.markdown(
+    f"""<div class="subtle">
+          多週期共振：看漲 {多週期共振.get('bull_count', 0)}（{','.join(多週期共振.get('bull_tfs', [])) or '無'}）
+          | 看跌 {多週期共振.get('bear_count', 0)}（{','.join(多週期共振.get('bear_tfs', [])) or '無'}）
+          | 觀望 {多週期共振.get('flat_count', 0)}（{','.join(多週期共振.get('flat_tfs', [])) or '無'}）
+        </div>""",
+    unsafe_allow_html=True,
+)
 
 控制列 = st.columns([1.35, 1.15])
 with 控制列[0]:
@@ -1954,74 +2292,133 @@ if not 回測樣本區.empty:
         回測天數 = max(0.0, float(_bt_span.total_seconds()) / 86400.0)
 
 # ── K線圖 ─────────────────────────────────────────────────────────────────────
-fig_k = K線圖(顯示區)
-if 顯示SNR:
-    all_levels = []
-    atr_proxy = float(顯示區["atr_14"].dropna().tail(100).median()) if "atr_14" in 顯示區.columns else (價格 * 0.002)
-    merge_tol = max(atr_proxy * 0.6, 價格 * 0.0008)
-    for tf in SNR候選週期:
-        src = 顯示區 if tf == 週期 else _嘗試載入週期資料(交易對, tf)
-        if src is None or src.empty:
-            continue
-        needed = [c for c in ["timestamp", "open", "high", "low", "close", "volume",
-                               "quote_asset_volume", "number_of_trades", "taker_buy_base", "taker_buy_quote"]
-                  if c in src.columns]
-        src2 = src[needed].copy()
-        lv = compute_snr_levels(src2, timeframe=tf, lookback_bars=800, pivot_window=5, max_levels=int(SNR最大線數))
-        all_levels.extend(lv)
-    merged = merge_multitimeframe_levels(all_levels, tolerance_abs=float(merge_tol))
-    _x_end = 顯示區["timestamp"].iloc[-1]
-    for lv in merged:
-        overlap_count = len(lv.timeframes)
-        if overlap_count < int(SNR重疊層數):
-            continue
-        tfs = ",".join(sorted(lv.timeframes,
-                               key=lambda x: ["5m", "15m", "30m", "1h", "1d"].index(x)
-                               if x in ["5m", "15m", "30m", "1h", "1d"] else 99))
-        kind = "S" if (lv.kinds == {"S"}) else ("R" if (lv.kinds == {"R"}) else "S/R")
-        color, line_opacity, label_bg, line_width = _snr_style(overlap_count, kind)
-        _touch = 顯示區[(顯示區["low"] <= float(lv.price)) & (顯示區["high"] >= float(lv.price))]
-        if _touch.empty:
-            continue
-        _x_start = _touch["timestamp"].iloc[0]
-        fig_k.add_shape(
-            type="line",
-            xref="x",
-            yref="y",
-            x0=_x_start,
-            x1=_x_end,
-            y0=float(lv.price),
-            y1=float(lv.price),
-            line=dict(color=color, width=line_width, dash="solid"),
-            opacity=line_opacity,
-        )
-        fig_k.add_annotation(
-            x=_x_end,
-            y=float(lv.price),
-            xref="x",
-            yref="y",
-            text=f"{kind} x{overlap_count} {tfs}",
-            showarrow=False,
-            xanchor="left",
-            xshift=6,
-            font=dict(color=color, size=11),
-            bgcolor=label_bg,
-        )
-
-st.plotly_chart(
-    fig_k,
-    use_container_width=True,
-    config={
-        "scrollZoom": True,
-        "displayModeBar": True,
-        "modeBarButtonsToAdd": ["pan2d", "zoom2d", "resetScale2d"],
-    },
-)
 _plotly_interact_config = {
     "scrollZoom": True,
     "displayModeBar": True,
     "modeBarButtonsToAdd": ["pan2d", "zoom2d", "resetScale2d"],
 }
+if _use_fragment_live_update and _fragment_api is not None:
+    @(_fragment_api(run_every=float(max(5, int(即時更新秒數)))))
+    def _live_kline_fragment() -> None:
+        上次更新 = float(st.session_state.get("kline_auto_last_update_ts", 0.0))
+        現在 = time.time()
+        if (現在 - 上次更新) >= int(即時更新秒數):
+            try:
+                os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(週期))
+                run_quick_update(symbol=交易對, interval=週期)
+                st.session_state["kline_auto_last_update_ts"] = 現在
+                st.session_state["kline_auto_last_msg"] = f"K線即時更新成功：{time.strftime('%H:%M:%S')}"
+            except FileNotFoundError:
+                st.session_state["kline_auto_last_msg"] = "K線即時更新失敗：尚未有該週期模型。"
+            except Exception as e:
+                st.session_state["kline_auto_last_msg"] = f"K線即時更新失敗：{e}"
+        _live_signals = 讀取訊號資料()
+        if _live_signals.empty:
+            _live_cached = st.session_state.get(_sig_cache_key)
+            if isinstance(_live_cached, pd.DataFrame) and not _live_cached.empty:
+                _live_signals = _live_cached.copy()
+            elif _sig_disk_cache.exists():
+                try:
+                    _live_disk = _safe_read_csv(_sig_disk_cache)
+                    if not _live_disk.empty and "timestamp" in _live_disk.columns:
+                        _live_disk["timestamp"] = pd.to_datetime(_live_disk["timestamp"], utc=True, errors="coerce")
+                        _live_disk = _live_disk[_live_disk["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
+                        if not _live_disk.empty:
+                            _live_signals = _live_disk
+                except Exception:
+                    pass
+            if _live_signals.empty:
+                _live_signals = _build_fallback_signals_from_raw(交易對, 週期, keep_rows=max(1000, int(K線根數)))
+        _live_show = _live_signals.tail(int(K線根數)).copy() if not _live_signals.empty else 顯示區
+        _live_price = float(pd.to_numeric(_live_show["close"], errors="coerce").iloc[-1]) if not _live_show.empty else 價格
+        _render_kline_with_snr(
+            _live_show,
+            _live_price,
+            symbol=交易對,
+            interval=週期,
+            show_snr=顯示SNR,
+            snr_intervals=SNR候選週期,
+            snr_overlap_min=int(SNR重疊層數),
+            snr_max_levels=int(SNR最大線數),
+            plotly_cfg=_plotly_interact_config,
+        )
+        if st.session_state.get("kline_auto_last_msg"):
+            st.caption(str(st.session_state["kline_auto_last_msg"]))
+    _live_kline_fragment()
+else:
+    _render_kline_with_snr(
+        顯示區,
+        價格,
+        symbol=交易對,
+        interval=週期,
+        show_snr=顯示SNR,
+        snr_intervals=SNR候選週期,
+        snr_overlap_min=int(SNR重疊層數),
+        snr_max_levels=int(SNR最大線數),
+        plotly_cfg=_plotly_interact_config,
+    )
+
+if _use_auto_trade_fragment and _fragment_api is not None:
+    @(_fragment_api(run_every=float(max(10, int(自動交易秒數)))))
+    def _live_auto_trade_fragment() -> None:
+        if not okx_enable:
+            st.session_state["auto_trade_last_msg"] = "已開啟純AI自動交易，但目前未允許下單。"
+            return
+
+        _sig = 讀取訊號資料()
+        if _sig.empty:
+            _sig = _build_fallback_signals_from_raw(交易對, 週期, keep_rows=max(1000, int(K線根數)))
+            if _sig.empty:
+                st.session_state["auto_trade_last_msg"] = "自動交易略過：目前讀不到可用訊號。"
+                return
+        _latest = _sig.iloc[-1]
+        _price = 取得數值(_latest, "close")
+
+        pos = st.session_state.get("auto_pos_state")
+        if isinstance(pos, dict) and pos.get("entry") and pos.get("side") in {"long", "short"}:
+            entry = float(pos["entry"])
+            side = str(pos["side"])
+            tp = float(自動止盈百分比) / 100.0
+            sl = float(自動止損百分比) / 100.0
+            if side == "long":
+                tp_hit = _price >= entry * (1.0 + tp)
+                sl_hit = _price <= entry * (1.0 - sl)
+            else:
+                tp_hit = _price <= entry * (1.0 - tp)
+                sl_hit = _price >= entry * (1.0 + sl)
+            if tp_hit:
+                _run_okx("CLOSE")
+                st.session_state["auto_pos_state"] = None
+                st.session_state["auto_trade_last_msg"] = f"止盈出場 (TP {float(自動止盈百分比):.1f}%) 入場:{entry:,.2f}"
+            elif sl_hit:
+                _run_okx("CLOSE")
+                st.session_state["auto_pos_state"] = None
+                st.session_state["auto_trade_last_msg"] = f"止損出場 (SL {float(自動止損百分比):.1f}%) 入場:{entry:,.2f}"
+
+        last_sig = str(st.session_state.get("auto_trade_last_signal_sig", ""))
+        now_sig = (
+            f"{_latest['timestamp']}|{int(取得數值(_latest,'signal',0))}|"
+            f"{float(取得數值(_latest,'suggested_leverage',1.0)):.2f}|"
+            f"{int(取得數值(_latest,'trade_allowed',1))}|"
+            f"{str(_latest.get('trade_block_reason', ''))}"
+        )
+        if now_sig != last_sig and not st.session_state.get("auto_pos_state"):
+            _auto_res = _run_okx("AUTO")
+            st.session_state["auto_trade_last_signal_sig"] = now_sig
+            _risk = (_auto_res or {}).get("risk_controls", {}) if isinstance(_auto_res, dict) else {}
+            _auto_action = str((_auto_res or {}).get("action", "") or "")
+            _auto_note = str(_risk.get("note", "") or "").strip()
+            if _auto_action == "HOLD":
+                if _auto_note:
+                    st.session_state["auto_trade_last_msg"] = f"純AI自動交易 HOLD：{_auto_note}"
+                elif bool(_risk.get("hold_due_to_black_swan", False)):
+                    st.session_state["auto_trade_last_msg"] = "黑天鵝風險啟動：自動交易暫停，請手動操作倉位。"
+                else:
+                    st.session_state["auto_trade_last_msg"] = "純AI自動交易 HOLD（未送單）"
+            else:
+                st.session_state["auto_trade_last_msg"] = f"純AI自動交易已執行（新訊號）：{_latest['timestamp']}"
+
+    _live_auto_trade_fragment()
 
 # ── 分頁 ─────────────────────────────────────────────────────────────────────
 分頁 = st.tabs([
@@ -2408,28 +2805,13 @@ with 分頁[8]:
         else:
             st.warning("找不到 Teacher 報告檔案。")
 
-# ── 自動刷新循環（非阻塞，避免 sleep+rerun 導致前端殘留重複 UI） ───────────────────
-if 即時更新啟用 or 自動交易啟用:
-    refresh_s = int(min(
-        int(即時更新秒數) if 即時更新啟用 else 3600,
-        int(自動交易秒數) if 自動交易啟用 else 3600
-    ))
-    st.sidebar.caption(f"⏱ 自動循環中，每 {refresh_s} 秒刷新一次。")
-    _reload_ms = max(1000, int(refresh_s) * 1000)
-    components.html(
-        f"""
-        <script>
-        (function() {{
-          const ms = {_reload_ms};
-          if (window.__aiDashboardReloadTimer) {{
-            clearTimeout(window.__aiDashboardReloadTimer);
-          }}
-          window.__aiDashboardReloadTimer = setTimeout(function() {{
-            window.location.reload();
-          }}, ms);
-        }})();
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
+# ── 自動刷新狀態（純 fragment，避免整頁跳轉） ────────────────────────────────
+if 即時更新啟用 and _use_fragment_live_update:
+    st.sidebar.caption(f"⏱ K線即時更新中，每 {int(即時更新秒數)} 秒局部刷新圖表。")
+elif 即時更新啟用:
+    st.sidebar.caption("⚠️ 目前環境不支援 fragment 自動刷新，請手動點擊快速更新。")
+
+if 自動交易啟用 and _use_auto_trade_fragment:
+    st.sidebar.caption(f"🤖 純AI自動交易中，每 {int(自動交易秒數)} 秒檢查一次。")
+elif 自動交易啟用:
+    st.sidebar.caption("⚠️ 目前環境不支援 fragment 自動交易輪詢，請手動觸發或開啟可用版本。")

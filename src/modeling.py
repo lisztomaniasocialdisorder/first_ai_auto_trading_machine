@@ -685,6 +685,20 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
         np.where((p_short > signal_threshold) & (p_short > p_long), -1, 0),
     )
 
+    # SNR-aware override: when multi-layer supports/resistances are clearly broken,
+    # allow breaking out of flat state even if base probability is slightly below threshold.
+    snr_break_s = pd.to_numeric(df.get("snr_break_support_count", 0), errors="coerce").fillna(0).to_numpy()
+    snr_break_r = pd.to_numeric(df.get("snr_break_resistance_count", 0), errors="coerce").fillna(0).to_numpy()
+    snr_overlap_s = pd.to_numeric(df.get("snr_overlap_support_count", 0), errors="coerce").fillna(0).to_numpy()
+    snr_overlap_r = pd.to_numeric(df.get("snr_overlap_resistance_count", 0), errors="coerce").fillna(0).to_numpy()
+
+    snr_strong_bear = (snr_break_s >= 3) & (snr_break_s >= (snr_break_r + 1)) & (snr_overlap_s >= 2)
+    snr_strong_bull = (snr_break_r >= 3) & (snr_break_r >= (snr_break_s + 1)) & (snr_overlap_r >= 2)
+    soft_th = max(0.33, float(signal_threshold) - 0.08)
+    promote_short = (signal == 0) & snr_strong_bear & (p_short >= soft_th) & (p_short > p_long)
+    promote_long = (signal == 0) & snr_strong_bull & (p_long >= soft_th) & (p_long > p_short)
+    signal = np.where(promote_short, -1, np.where(promote_long, 1, signal))
+
     raw_lev = models.lev_reg.predict(x)
     confidence = np.maximum(p_long, p_short) - p_flat
     conf_scale = np.clip(confidence * 2.0, 0.2, 1.0)
@@ -744,6 +758,8 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
     out["expected_cost_pct"] = np.round(expected_cost_pct, 4)
     out["net_edge_pct"] = np.round(net_edge_pct, 4)
     out["regime_alignment"] = np.where(signal == regime_bias, 1, 0)
+    out["snr_strong_bear_break"] = snr_strong_bear.astype(int)
+    out["snr_strong_bull_break"] = snr_strong_bull.astype(int)
 
     trade_allowed = signal != 0
     block_reason = np.full(len(out), "", dtype=object)
@@ -752,6 +768,9 @@ def infer_signals(df: pd.DataFrame, models: TrainedModels, settings: Settings) -
     trend_mask = (regime.to_numpy() == "trend") & (~flat_mask) & (signal != regime_bias)
     volatile_mask = (regime.to_numpy() == "volatile") & (~flat_mask) & (confidence_index < (signal_threshold + 0.05))
     ranging_mask = (regime.to_numpy() == "ranging") & (~flat_mask) & (confidence_index < (signal_threshold + 0.02))
+    snr_break_override_mask = (signal != 0) & (snr_strong_bear | snr_strong_bull)
+    volatile_mask = volatile_mask & (~snr_break_override_mask)
+    ranging_mask = ranging_mask & (~snr_break_override_mask)
     trade_allowed = trade_allowed & (~edge_mask) & (~trend_mask) & (~volatile_mask) & (~ranging_mask)
     block_reason = np.where(flat_mask, "flat signal", block_reason)
     block_reason = np.where(edge_mask, "expected edge <= cost", block_reason)

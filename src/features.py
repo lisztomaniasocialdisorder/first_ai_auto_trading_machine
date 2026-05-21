@@ -28,6 +28,95 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def _infer_bar_seconds(ts: pd.Series) -> int:
+    if ts is None or ts.empty:
+        return 3600
+    x = pd.to_datetime(ts, utc=True, errors="coerce").dropna()
+    if len(x) < 3:
+        return 3600
+    diffs = x.diff().dt.total_seconds().dropna()
+    if diffs.empty:
+        return 3600
+    try:
+        sec = int(diffs.mode().iloc[0])
+    except Exception:
+        sec = 3600
+    return max(60, sec)
+
+
+def _snr_window_bars_from_interval(bar_seconds: int) -> list[int]:
+    # Multi-timeframe targets used to create SNR-like training features.
+    target_secs = [15 * 60, 30 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60]
+    out: list[int] = []
+    for target in target_secs:
+        bars = int(round(target / max(1, bar_seconds)))
+        bars = max(3, bars)
+        if bars not in out:
+            out.append(bars)
+    return sorted(out)
+
+
+def _add_snr_training_features(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy()
+    bar_seconds = _infer_bar_seconds(x.get("timestamp"))
+    windows = _snr_window_bars_from_interval(bar_seconds)
+    eps = 1e-9
+
+    atr = pd.to_numeric(x.get("atr_14"), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    atr_fallback = (pd.to_numeric(x.get("close"), errors="coerce").abs() * 0.002).fillna(1.0)
+    atr = atr.fillna(atr_fallback)
+    atr = pd.Series(np.where(atr <= 0, atr_fallback, atr), index=x.index, dtype="float64").clip(lower=eps)
+
+    near_s_cols: list[str] = []
+    near_r_cols: list[str] = []
+    break_s_cols: list[str] = []
+    break_r_cols: list[str] = []
+    dist_s_cols: list[str] = []
+    dist_r_cols: list[str] = []
+
+    for bars in windows:
+        min_periods = max(3, int(bars * 0.5))
+        s_col = f"snr_support_q10_{bars}"
+        r_col = f"snr_resistance_q90_{bars}"
+        x[s_col] = x["low"].rolling(bars, min_periods=min_periods).quantile(0.10)
+        x[r_col] = x["high"].rolling(bars, min_periods=min_periods).quantile(0.90)
+
+        near_s_col = f"snr_near_support_{bars}"
+        near_r_col = f"snr_near_resistance_{bars}"
+        break_s_col = f"snr_break_support_{bars}"
+        break_r_col = f"snr_break_resistance_{bars}"
+        dist_s_col = f"snr_dist_support_atr_{bars}"
+        dist_r_col = f"snr_dist_resistance_atr_{bars}"
+
+        x[dist_s_col] = (x["close"] - x[s_col]) / atr
+        x[dist_r_col] = (x[r_col] - x["close"]) / atr
+
+        tol = atr * 0.60
+        x[near_s_col] = ((x["close"] - x[s_col]).abs() <= tol).astype(int)
+        x[near_r_col] = ((x["close"] - x[r_col]).abs() <= tol).astype(int)
+        x[break_s_col] = (x["close"] < (x[s_col] - atr * 0.25)).astype(int)
+        x[break_r_col] = (x["close"] > (x[r_col] + atr * 0.25)).astype(int)
+
+        near_s_cols.append(near_s_col)
+        near_r_cols.append(near_r_col)
+        break_s_cols.append(break_s_col)
+        break_r_cols.append(break_r_col)
+        dist_s_cols.append(dist_s_col)
+        dist_r_cols.append(dist_r_col)
+
+    x["snr_overlap_support_count"] = x[near_s_cols].sum(axis=1)
+    x["snr_overlap_resistance_count"] = x[near_r_cols].sum(axis=1)
+    x["snr_break_support_count"] = x[break_s_cols].sum(axis=1)
+    x["snr_break_resistance_count"] = x[break_r_cols].sum(axis=1)
+    x["snr_break_pressure"] = x["snr_break_resistance_count"] - x["snr_break_support_count"]
+
+    x["snr_nearest_support_dist_atr"] = x[dist_s_cols].abs().min(axis=1)
+    x["snr_nearest_resistance_dist_atr"] = x[dist_r_cols].abs().min(axis=1)
+    x["snr_overlap_imbalance"] = x["snr_overlap_support_count"] - x["snr_overlap_resistance_count"]
+
+    return x
+
+
 def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy().sort_values("timestamp").reset_index(drop=True)
 
@@ -91,6 +180,7 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     x["is_uptrend"] = (x["ma_20"] > x["ma_50"]).astype(int)
     x["is_downtrend"] = (x["ma_20"] < x["ma_50"]).astype(int)
 
+    x = _add_snr_training_features(x)
     x = add_regime_features(x)
     return x
 
