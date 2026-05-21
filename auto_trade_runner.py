@@ -219,14 +219,15 @@ def run_loop(
                     f"[{_utc_now_str()}] Action={trade_res.get('action')} "
                     f"price={trade_res.get('price')} lev={trade_res.get('leverage')} size={trade_res.get('size')}"
                 )
-                append_okx_order_record(
-                    outputs_dir=outputs_dir,
-                    source="background_runner",
-                    symbol=active_symbol,
-                    interval=active_interval,
-                    trade_res=trade_res,
-                    control_payload=control,
-                )
+                if str(trade_res.get("action", "")) != "HOLD":
+                    append_okx_order_record(
+                        outputs_dir=outputs_dir,
+                        source="background_runner",
+                        symbol=active_symbol,
+                        interval=active_interval,
+                        trade_res=trade_res,
+                        control_payload=control,
+                    )
                 _save_state(
                     state_file,
                     {

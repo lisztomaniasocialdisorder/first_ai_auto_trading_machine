@@ -1172,30 +1172,31 @@ def _run_okx(action: str) -> dict | None:
             if _act_msg == "HOLD":
                 _note = str((trade_res.get("risk_controls", {}) or {}).get("note", "")).strip()
                 if _note:
-                    st.sidebar.info(f"OKX HOLD（{action}）：{_note}")
+                    st.sidebar.info(f"OKX HOLD（{action}，不送單）：{_note}")
                 else:
-                    st.sidebar.info(f"OKX HOLD（{action}）")
+                    st.sidebar.info(f"OKX HOLD（{action}，不送單）")
             else:
                 st.sidebar.success(f"OKX 完成：{_act_msg} ({action})")
             st.session_state["okx_last"] = trade_res
-            append_okx_order_record(
-                outputs_dir=OUTPUT_DIR,
-                source="dashboard_manual" if action in {"LONG", "SHORT", "CLOSE"} else "dashboard_auto",
-                symbol=str(交易對),
-                interval=str(週期),
-                trade_res=trade_res,
-                control_payload={
-                    "mode": "pure_ai",
-                    "okx_inst_id": str(okx_inst),
-                    "okx_notional_usdt": float(okx_notional),
-                    "okx_black_swan_reserve_usdt": float(st.session_state.get("ui_black_swan_reserve_usdt", 0.0)),
-                    "okx_black_swan_threshold": float(st.session_state.get("ui_black_swan_threshold", 1.0)),
-                    "okx_enable_trading": bool(okx_enable),
-                    "okx_simulated": True,
-                    "okx_max_leverage": 100,
-                },
-            )
             act = str(trade_res.get("action", ""))
+            if act != "HOLD":
+                append_okx_order_record(
+                    outputs_dir=OUTPUT_DIR,
+                    source="dashboard_manual" if action in {"LONG", "SHORT", "CLOSE"} else "dashboard_auto",
+                    symbol=str(交易對),
+                    interval=str(週期),
+                    trade_res=trade_res,
+                    control_payload={
+                        "mode": "pure_ai",
+                        "okx_inst_id": str(okx_inst),
+                        "okx_notional_usdt": float(okx_notional),
+                        "okx_black_swan_reserve_usdt": float(st.session_state.get("ui_black_swan_reserve_usdt", 0.0)),
+                        "okx_black_swan_threshold": float(st.session_state.get("ui_black_swan_threshold", 1.0)),
+                        "okx_enable_trading": bool(okx_enable),
+                        "okx_simulated": True,
+                        "okx_max_leverage": 100,
+                    },
+                )
             px = float(trade_res.get("price", 0.0) or 0.0)
             if act == "OPEN_LONG":
                 st.session_state["auto_pos_state"] = {
