@@ -20,12 +20,32 @@ def _expectancy_unit(win_rate: float, pnl_ratio: float) -> float:
     return (w * r) - (1.0 - w)
 
 
+def _wf_min_train_for_interval(interval: str) -> int:
+    return {
+        "5m": 1400,
+        "15m": 1100,
+        "30m": 900,
+        "1h": 700,
+        "1d": 240,
+    }.get(str(interval), 700)
+
+
+def _wf_min_test_for_interval(interval: str) -> int:
+    return {
+        "5m": 140,
+        "15m": 120,
+        "30m": 100,
+        "1h": 80,
+        "1d": 40,
+    }.get(str(interval), 80)
+
+
 def run_walkforward_validation(
     df: pd.DataFrame,
     settings: Settings,
     *,
     n_folds: int = 4,
-    min_train_rows: int = 1000,
+    min_train_rows: int | None = None,
     test_rows: int | None = None,
 ) -> dict:
     x = df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -34,17 +54,30 @@ def run_walkforward_validation(
     x = x.dropna(subset=["timestamp", "close", "label"]).reset_index(drop=True)
 
     total_rows = int(len(x))
-    min_train = max(int(settings.min_train_rows), int(min_train_rows))
-    if total_rows < (min_train + 200):
-        raise RuntimeError(f"walk-forward 資料不足，需要至少 {min_train + 200} 根，目前只有 {total_rows} 根")
-
-    default_test_rows = max(150, int(total_rows * 0.10))
-    fold_test_rows = int(test_rows or default_test_rows)
-    fold_test_rows = max(100, min(fold_test_rows, max(100, total_rows // max(2, n_folds + 1))))
     interval_sec = max(1, int(interval_to_seconds(settings.interval)))
     embargo_bars = max(1, int(np.ceil((float(settings.future_horizon_hours) * 3600.0) / float(interval_sec))))
 
-    wf_settings = replace(settings, max_train_rows=0)
+    base_min_train = int(_wf_min_train_for_interval(settings.interval))
+    req_min_train = int(base_min_train if min_train_rows is None else min_train_rows)
+    req_min_train = max(80, req_min_train)
+    min_train = req_min_train
+    # 若樣本不足，對低週期/高週期都採自適應縮放，至少能跑出可檢視的 OOS 結果。
+    if total_rows < (min_train + max(40, 2 * embargo_bars + 20)):
+        min_train = max(80, int(total_rows * 0.55))
+    min_train = min(min_train, max(80, total_rows - max(40, 2 * embargo_bars + 20)))
+    if total_rows < (min_train + max(40, 2 * embargo_bars + 20)):
+        raise RuntimeError(f"walk-forward 資料不足，需要至少 {min_train + max(40, 2 * embargo_bars + 20)} 根，目前只有 {total_rows} 根")
+
+    min_test = int(_wf_min_test_for_interval(settings.interval))
+    default_test_rows = max(min_test, int(total_rows * 0.10))
+    fold_test_rows = int(test_rows or default_test_rows)
+    fold_test_rows = max(min_test, min(fold_test_rows, max(min_test, total_rows // max(2, n_folds + 1))))
+
+    # 樣本不足時自動降低 fold 數，避免直接報錯卡住。
+    max_folds_possible = max(1, int((total_rows - min_train - embargo_bars) // max(1, fold_test_rows + embargo_bars)))
+    n_folds = max(1, min(int(n_folds), max_folds_possible))
+
+    wf_settings = replace(settings, max_train_rows=0, min_train_rows=int(min_train))
     train_end = min_train
     folds: list[dict] = []
     fold_curves: list[pd.DataFrame] = []

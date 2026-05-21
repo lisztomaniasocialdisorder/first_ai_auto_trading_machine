@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
@@ -219,6 +220,13 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
     snr_break_r = int(pd.to_numeric(row.get("snr_break_resistance_count", 0), errors="coerce") or 0)
     snr_ov_s = int(pd.to_numeric(row.get("snr_overlap_support_count", 0), errors="coerce") or 0)
     snr_ov_r = int(pd.to_numeric(row.get("snr_overlap_resistance_count", 0), errors="coerce") or 0)
+    plus_di = float(pd.to_numeric(row.get("plus_di", 0), errors="coerce") or 0)
+    minus_di = float(pd.to_numeric(row.get("minus_di", 0), errors="coerce") or 0)
+    trade_allowed = int(pd.to_numeric(row.get("trade_allowed", 1), errors="coerce") or 0)
+    panic_score = float(pd.to_numeric(row.get("market_panic_score", 0), errors="coerce") or 0)
+    macro_risk = float(pd.to_numeric(row.get("macro_event_risk_score", 0), errors="coerce") or 0)
+    war_score = float(pd.to_numeric(row.get("war_news_score", 0), errors="coerce") or 0)
+    panic_news = float(pd.to_numeric(row.get("panic_news_score", 0), errors="coerce") or 0)
     block_reason = str(row.get("trade_block_reason", "") or "").strip()
 
     bull: list[str] = []
@@ -228,31 +236,52 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
         bull.append(f"看漲機率高於看跌（{p_long*100:.1f}% > {p_short*100:.1f}%）。")
     elif p_short > p_long:
         bear.append(f"看跌機率高於看漲（{p_short*100:.1f}% > {p_long*100:.1f}%）。")
+    if abs(p_long - p_short) >= 0.10:
+        if p_long > p_short:
+            bull.append(f"多空機率差距明顯（+{(p_long-p_short)*100:.1f}%）。")
+        else:
+            bear.append(f"多空機率差距明顯（-{(p_short-p_long)*100:.1f}%）。")
     if p_flat >= 0.45:
         bear.append(f"觀望機率偏高（{p_flat*100:.1f}%），代表市場方向不明。")
+    elif p_flat <= 0.25:
+        bull.append(f"觀望機率偏低（{p_flat*100:.1f}%），市場有方向傾向。")
 
     if macd_hist > 0:
         bull.append("MACD 柱體為正，動能偏多。")
     elif macd_hist < 0:
         bear.append("MACD 柱體為負，動能偏空。")
+    if plus_di > minus_di and plus_di > 20:
+        bull.append(f"方向動能 +DI({plus_di:.1f}) > -DI({minus_di:.1f})。")
+    if minus_di > plus_di and minus_di > 20:
+        bear.append(f"方向動能 -DI({minus_di:.1f}) > +DI({plus_di:.1f})。")
 
     if rsi <= 35:
         bull.append(f"RSI 偏低（{rsi:.1f}），存在反彈機會。")
     elif rsi >= 65:
         bear.append(f"RSI 偏高（{rsi:.1f}），短線回落風險上升。")
+    if 45 <= rsi <= 55:
+        bear.append(f"RSI 接近中性（{rsi:.1f}），趨勢延續力道有限。")
 
     if fear_greed >= 70:
         bull.append(f"恐懼貪婪指數偏高（{fear_greed:.0f}），市場情緒偏多。")
     elif fear_greed <= 30:
         bear.append(f"恐懼貪婪指數偏低（{fear_greed:.0f}），風險偏好不足。")
+    elif 45 <= fear_greed <= 55:
+        bear.append(f"情緒中性（{fear_greed:.0f}），方向性訊號較弱。")
 
     if vol24 > 0.05 or atr_pct > 0.02:
         bear.append("波動率偏高，假突破與回撤風險增加。")
     elif vol24 < 0.025 and atr_pct < 0.012:
         bull.append("波動率相對可控，趨勢延續機率較佳。")
+    if atr_pct > 0.03:
+        bear.append(f"ATR% 偏高（{atr_pct*100:.2f}%），槓桿應降低。")
+    if vol24 < 0.015:
+        bull.append(f"24h 實現波動低（{vol24*100:.2f}%），訊號噪音相對較小。")
 
     if drawdown <= -0.10:
         bear.append("近期回撤偏深，模型風控會傾向保守。")
+    elif drawdown >= -0.03:
+        bull.append("近期回撤受控，資金曲線尚穩定。")
 
     if snr_break_s >= 2:
         bear.append(f"SNR 支撐摜破偏強（{snr_break_s} 層），短線偏空。")
@@ -262,6 +291,22 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
         bull.append(f"下方有 {snr_ov_s} 層支撐重疊，存在承接機會。")
     if snr_ov_r >= 2:
         bear.append(f"上方有 {snr_ov_r} 層壓力重疊，突破難度偏高。")
+    if snr_ov_s >= 3:
+        bull.append("多層支撐密集，回踩後承接機率提升。")
+    if snr_ov_r >= 3:
+        bear.append("多層壓力密集，上攻延續難度偏高。")
+
+    if panic_score >= 2.0:
+        bear.append(f"事件風險分數偏高（{panic_score:.2f}），策略應偏防守。")
+    if macro_risk > 0:
+        bear.append("CPI/PPI/FOMC 時段風險開啟，建議降槓桿。")
+    if war_score > 0:
+        bear.append("偵測到戰爭/地緣衝突新聞分數，尾部風險上升。")
+    if panic_news > 0:
+        bear.append("偵測到金融恐慌新聞分數，短線波動失真機率升高。")
+
+    if trade_allowed == 0:
+        bear.append("目前模型判定為不建議開新倉。")
     if block_reason:
         bear.append(f"目前被風控擋單：{block_reason}。")
 
@@ -270,7 +315,8 @@ def _build_bull_bear_reasons(row: pd.Series) -> tuple[list[str], list[str]]:
     if not bear:
         bear.append("目前偏空依據不足，空方動能尚未明顯擴大。")
 
-    return bull[:4], bear[:4]
+    # 多給一些上下文，方便人工判讀，不再只截 4 條。
+    return bull[:10], bear[:10]
 
 
 週期資料門檻 = {
@@ -477,6 +523,18 @@ st.markdown(
         border: 1px solid #1e3a5f; border-radius: 14px;
         padding: 18px 20px; margin-bottom: 4px;
       }
+      .state-pill {
+        display:inline-block;
+        padding:6px 12px;
+        border-radius:999px;
+        font-size:0.86rem;
+        font-weight:700;
+        letter-spacing:.02em;
+        margin-right:8px;
+      }
+      .state-ok { background:rgba(34,197,94,.18); color:#4ade80; border:1px solid rgba(34,197,94,.35); }
+      .state-warn { background:rgba(250,204,21,.16); color:#fde047; border:1px solid rgba(250,204,21,.35); }
+      .state-stop { background:rgba(239,68,68,.18); color:#f87171; border:1px solid rgba(239,68,68,.35); }
 
       /* Table styling */
       .stDataFrame { border-radius: 12px; overflow: hidden; }
@@ -490,6 +548,21 @@ st.markdown(
         cursor: default !important;
       }
 
+      /* Hide top-right running/status widget to reduce visual dim/flicker while fragments rerun */
+      div[data-testid="stStatusWidget"] {
+        display: none !important;
+        visibility: hidden !important;
+      }
+
+      /* Prevent Streamlit stale-element dimming during reruns */
+      [stale_data="true"],
+      [data-stale="true"],
+      .element-container[stale_data="true"],
+      .element-container[data-stale="true"] {
+        opacity: 1 !important;
+        filter: none !important;
+      }
+
       /* Guard against sporadic duplicated tab headers in Streamlit frontend */
       [data-testid="stTabs"] [data-baseweb="tab-list"] + [data-baseweb="tab-list"] {
         display: none !important;
@@ -498,6 +571,232 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def _inject_middle_drag_xzoom() -> None:
+    """圖表互動強化：中鍵拖曳縮放Y軸、Shift+滾輪縮放Y軸，並保留原有X軸同步。"""
+    components.html(
+        """
+        <script>
+        (function () {
+          const root = window.parent || window;
+          const doc = root.document;
+          if (!doc || root.__midDragXZoomInstalled) return;
+          root.__midDragXZoomInstalled = true;
+          const RANGE_KEY = "btc_dash_kline_xrange";
+
+          function toMs(v) {
+            if (v === null || v === undefined) return NaN;
+            if (typeof v === "number") return v;
+            const t = Date.parse(v);
+            if (!Number.isNaN(t)) return t;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : NaN;
+          }
+          function fromMs(ms, sample) {
+            if (typeof sample === "number") return ms;
+            return new Date(ms).toISOString();
+          }
+          function bind(gd) {
+            if (!gd || gd.__midDragXZoomBound) return;
+            gd.__midDragXZoomBound = true;
+            let state = null;
+            function hasDateXAxis(plot) {
+              try {
+                const t = (((plot || {})._fullLayout || {}).xaxis || {}).type;
+                return t === "date";
+              } catch (_) {
+                return false;
+              }
+            }
+            function isXSyncEligible(plot) {
+              try {
+                if (!hasDateXAxis(plot)) return false;
+                const u = String((((plot || {})._fullLayout || {}).uirevision) || "");
+                return u !== "fg-history-static";
+              } catch (_) {
+                return false;
+              }
+            }
+            function datePlots() {
+              return Array.from(doc.querySelectorAll(".js-plotly-plot")).filter(isXSyncEligible);
+            }
+            function yKeyFor(plot) {
+              const idx = datePlots().indexOf(plot);
+              return idx >= 0 ? `btc_dash_yrange_${idx}` : null;
+            }
+            function syncAllXRange(sourceGd, r0, r1) {
+              if (!root.Plotly || !root.Plotly.relayout) return;
+              if (!isXSyncEligible(sourceGd)) return;
+              const plots = doc.querySelectorAll(".js-plotly-plot");
+              plots.forEach(function (other) {
+                if (!other || other === sourceGd) return;
+                if (!isXSyncEligible(other)) return; // 排除買賣機率與FG歷史圖等
+                if (other.__xsyncApplying) return;
+                try {
+                  other.__xsyncApplying = true;
+                  root.Plotly.relayout(other, {
+                    "xaxis.range[0]": r0,
+                    "xaxis.range[1]": r1,
+                  });
+                } catch (_) {}
+                setTimeout(function () { other.__xsyncApplying = false; }, 0);
+              });
+            }
+            try {
+              const raw = root.localStorage ? root.localStorage.getItem(RANGE_KEY) : null;
+              if (isXSyncEligible(gd) && raw && root.Plotly && root.Plotly.relayout) {
+                const saved = JSON.parse(raw);
+                if (saved && saved.r0 !== undefined && saved.r1 !== undefined) {
+                  root.Plotly.relayout(gd, {
+                    "xaxis.range[0]": saved.r0,
+                    "xaxis.range[1]": saved.r1,
+                  });
+                }
+              }
+            } catch (_) {}
+            try {
+              if (hasDateXAxis(gd)) {
+                const yKey = yKeyFor(gd);
+                const rawY = (yKey && root.localStorage) ? root.localStorage.getItem(yKey) : null;
+                if (rawY && root.Plotly && root.Plotly.relayout) {
+                  const savedY = JSON.parse(rawY);
+                  if (savedY && savedY.y0 !== undefined && savedY.y1 !== undefined) {
+                    root.Plotly.relayout(gd, {
+                      "yaxis.range[0]": savedY.y0,
+                      "yaxis.range[1]": savedY.y1,
+                    });
+                  }
+                }
+              }
+            } catch (_) {}
+
+            if (typeof gd.on === "function") {
+              gd.on("plotly_relayout", function (ev) {
+                try {
+                  if (gd.__xsyncApplying) return;
+                  let r0 = ev && ev["xaxis.range[0]"];
+                  let r1 = ev && ev["xaxis.range[1]"];
+                  if ((r0 === undefined || r1 === undefined) && ev && Array.isArray(ev["xaxis.range"])) {
+                    r0 = ev["xaxis.range"][0];
+                    r1 = ev["xaxis.range"][1];
+                  }
+                  if (r0 !== undefined && r1 !== undefined && isXSyncEligible(gd)) {
+                    if (root.localStorage) {
+                      root.localStorage.setItem(RANGE_KEY, JSON.stringify({ r0, r1 }));
+                    }
+                    syncAllXRange(gd, r0, r1);
+                  }
+                  const y0 = ev && ev["yaxis.range[0]"];
+                  const y1 = ev && ev["yaxis.range[1]"];
+                  if (y0 !== undefined && y1 !== undefined && hasDateXAxis(gd)) {
+                    const yKey = yKeyFor(gd);
+                    if (yKey && root.localStorage) {
+                      root.localStorage.setItem(yKey, JSON.stringify({ y0, y1 }));
+                    }
+                  }
+                } catch (_) {}
+              });
+            }
+            gd.addEventListener("mousedown", function (e) {
+              if (e.button !== 1) return;
+              if (!hasDateXAxis(gd)) return;
+              const fl = gd._fullLayout || {};
+              const yr = (fl.yaxis && fl.yaxis.range) || ((gd.layout || {}).yaxis || {}).range;
+              if (!yr || yr.length < 2) return;
+              const y0 = Number(yr[0]);
+              const y1 = Number(yr[1]);
+              if (!Number.isFinite(y0) || !Number.isFinite(y1) || y1 <= y0) return;
+              state = { startY: e.clientY, y0, y1 };
+              e.preventDefault();
+            }, { passive: false });
+
+            root.addEventListener("mousemove", function (e) {
+              if (!state) return;
+              const dy = e.clientY - state.startY;
+              const height = Math.max(220, gd.clientHeight || 1);
+              const factor = Math.exp(dy / height);
+              const mid = (state.y0 + state.y1) / 2.0;
+              const half = Math.max(1e-9, ((state.y1 - state.y0) / 2.0) * factor);
+              const n0 = mid - half;
+              const n1 = mid + half;
+              try {
+                if (root.Plotly && root.Plotly.relayout) {
+                  root.Plotly.relayout(gd, {
+                    "yaxis.range[0]": n0,
+                    "yaxis.range[1]": n1,
+                  });
+                }
+              } catch (_) {}
+              e.preventDefault();
+            }, { passive: false });
+
+            root.addEventListener("mouseup", function (e) {
+              if (!state) return;
+              if (e.button === 1) e.preventDefault();
+              state = null;
+            }, { passive: false });
+
+            gd.addEventListener("auxclick", function (e) {
+              if (e.button === 1) e.preventDefault();
+            }, { passive: false });
+
+            gd.addEventListener("wheel", function (e) {
+              if (!hasDateXAxis(gd)) return;
+              const fl = gd._fullLayout || {};
+              const step = (e.deltaY || 0);
+              if (!Number.isFinite(step) || step === 0) return;
+              const factor = Math.exp(step / 420.0);
+              try {
+                if (e.shiftKey) {
+                  // Shift + wheel => zoom Y axis
+                  const yr = (fl.yaxis && fl.yaxis.range) || ((gd.layout || {}).yaxis || {}).range;
+                  if (!yr || yr.length < 2) return;
+                  const y0 = Number(yr[0]);
+                  const y1 = Number(yr[1]);
+                  if (!Number.isFinite(y0) || !Number.isFinite(y1) || y1 <= y0) return;
+                  const yMid = (y0 + y1) / 2.0;
+                  const yHalf = Math.max(1e-9, ((y1 - y0) / 2.0) * factor);
+                  if (root.Plotly && root.Plotly.relayout) {
+                    root.Plotly.relayout(gd, {
+                      "yaxis.range[0]": yMid - yHalf,
+                      "yaxis.range[1]": yMid + yHalf,
+                    });
+                  }
+                } else {
+                  // Wheel => zoom X axis
+                  const xr = (fl.xaxis && fl.xaxis.range) || ((gd.layout || {}).xaxis || {}).range;
+                  if (!xr || xr.length < 2) return;
+                  const x0 = toMs(xr[0]);
+                  const x1 = toMs(xr[1]);
+                  if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 <= x0) return;
+                  const xMid = (x0 + x1) / 2.0;
+                  const xHalf = Math.max(1, ((x1 - x0) / 2.0) * factor);
+                  const nx0 = fromMs(xMid - xHalf, xr[0]);
+                  const nx1 = fromMs(xMid + xHalf, xr[1]);
+                  if (root.Plotly && root.Plotly.relayout) {
+                    root.Plotly.relayout(gd, {
+                      "xaxis.range[0]": nx0,
+                      "xaxis.range[1]": nx1,
+                    });
+                  }
+                }
+              } catch (_) {}
+              e.preventDefault();
+            }, { passive: false });
+          }
+
+          function scan() {
+            doc.querySelectorAll(".js-plotly-plot").forEach(bind);
+          }
+          scan();
+          new MutationObserver(scan).observe(doc.body, { childList: true, subtree: true });
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def 讀取訊號資料() -> pd.DataFrame:
@@ -660,10 +959,6 @@ def _snr_style(overlap_count: int, kind: str) -> tuple[str, float, str, int]:
 
 def K線圖(df: pd.DataFrame) -> go.Figure:
     x = df.copy().sort_values("timestamp").reset_index(drop=True)
-    y_low = float(x["low"].min())
-    y_high = float(x["high"].max())
-    y_span = max(y_high - y_low, float(x["close"].iloc[-1]) * 0.001)
-    y_pad = y_span * 0.12
 
     fig = go.Figure()
     fig.add_trace(
@@ -753,8 +1048,7 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
     )
     fig.update_yaxes(
         title="價格 (USDT)",
-        range=[y_low - y_pad, y_high + y_pad],
-        autorange=False,
+        autorange=True,
         gridcolor="#1e293b",
     )
     fig.update_xaxes(
@@ -769,17 +1063,31 @@ def K線圖(df: pd.DataFrame) -> go.Figure:
 
 
 def 買賣橫條圖(p_long: float, p_short: float, p_flat: float) -> go.Figure:
+    raw = []
+    for v in (p_long, p_short, p_flat):
+        try:
+            fv = float(v)
+        except Exception:
+            fv = 0.0
+        if not pd.notna(fv) or fv < 0:
+            fv = 0.0
+        raw.append(fv)
+    vmax = float(max(raw)) if raw else 0.0
+    if vmax <= 0:
+        vals = [33.33, 33.33, 33.34]
+    else:
+        vals = [x / vmax * 100.0 for x in raw]
     fig = go.Figure(
         data=[
             go.Bar(
-                x=[p_long * 100, p_short * 100, p_flat * 100],
+                x=vals,
                 y=["看漲機率", "看跌機率", "觀望機率"],
                 orientation="h",
                 marker=dict(
                     color=["#22c55e", "#ef4444", "#facc15"],
                     line=dict(width=0),
                 ),
-                text=[f"{p_long*100:.2f}%", f"{p_short*100:.2f}%", f"{p_flat*100:.2f}%"],
+                text=[f"{vals[0]:.2f}%", f"{vals[1]:.2f}%", f"{vals[2]:.2f}%"],
                 textposition="outside",
                 textfont=dict(size=14, color="#f0f4ff"),
             )
@@ -791,9 +1099,70 @@ def 買賣橫條圖(p_long: float, p_short: float, p_flat: float) -> go.Figure:
         margin=dict(l=20, r=20, t=10, b=20),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        dragmode="pan",
+        dragmode=False,
         xaxis_title="機率 (%)",
-        xaxis=dict(gridcolor="#1e293b", range=[0, 105]),
+        xaxis=dict(gridcolor="#1e293b", range=[0, 100], fixedrange=True),
+        yaxis=dict(fixedrange=True),
+    )
+    return fig
+
+
+def 恐懼貪婪歷史圖(df: pd.DataFrame) -> go.Figure:
+    d = pd.DataFrame()
+    cache_path = BASE_DIR / "data" / "cache_fng.json"
+    try:
+        if cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            rows = payload.get("data", [])
+            if isinstance(rows, list) and rows:
+                c = pd.DataFrame(rows)
+                c["timestamp"] = pd.to_datetime(pd.to_numeric(c.get("timestamp"), errors="coerce"), unit="s", utc=True, errors="coerce")
+                c["fear_greed_value"] = pd.to_numeric(c.get("value"), errors="coerce")
+                c["date"] = c["timestamp"].dt.floor("D")
+                d = c[["date", "fear_greed_value"]].dropna().drop_duplicates(subset=["date"]).sort_values("date")
+                d = d.rename(columns={"date": "timestamp"})
+    except Exception:
+        d = pd.DataFrame()
+
+    if d.empty:
+        d = df.copy()
+        if "timestamp" in d.columns:
+            d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True, errors="coerce")
+        else:
+            d["timestamp"] = pd.NaT
+        d["fear_greed_value"] = pd.to_numeric(d.get("fear_greed_value"), errors="coerce")
+        d = d[d["timestamp"].notna() & d["fear_greed_value"].notna()].sort_values("timestamp")
+        # Use daily points to avoid visually-flat intraday repeats.
+        d["date"] = d["timestamp"].dt.floor("D")
+        d = d.groupby("date", as_index=False)["fear_greed_value"].last().rename(columns={"date": "timestamp"})
+
+    d = d[d["timestamp"] >= pd.Timestamp("2022-01-01", tz="UTC")]
+    fig = go.Figure()
+    if not d.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=d["timestamp"],
+                y=d["fear_greed_value"],
+                name="恐懼貪婪",
+                mode="lines+markers",
+                line=dict(color="#f59e0b", width=2),
+                marker=dict(size=4, color="#f59e0b"),
+            )
+        )
+    fig.add_hline(y=25, line_dash="dot", line_color="#ef4444", opacity=0.5)
+    fig.add_hline(y=45, line_dash="dot", line_color="#f97316", opacity=0.4)
+    fig.add_hline(y=55, line_dash="dot", line_color="#84cc16", opacity=0.4)
+    fig.add_hline(y=75, line_dash="dot", line_color="#22c55e", opacity=0.5)
+    fig.update_layout(
+        template="plotly_dark",
+        height=280,
+        margin=dict(l=20, r=20, t=20, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="pan",
+        uirevision="fg-history-static",
+        xaxis=dict(gridcolor="#1e293b"),
+        yaxis=dict(gridcolor="#1e293b", range=[0, 100], title="FG 指數"),
     )
     return fig
 
@@ -814,11 +1183,15 @@ def 趨勢高低點圖(df: pd.DataFrame) -> go.Figure:
         uirevision="trend-static",
         xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
     )
+    fig.update_yaxes(fixedrange=False)
     return fig
 
 
 def MACD圖(df: pd.DataFrame) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": False}]])
+    _x = pd.to_datetime(df.get("timestamp"), utc=True, errors="coerce")
+    _x0 = _x.iloc[0] if len(_x) else None
+    _x1 = _x.iloc[-1] if len(_x) else None
     colors = ["#22c55e" if v >= 0 else "#ef4444" for v in df["macd_hist"].fillna(0)]
     fig.add_trace(go.Bar(x=df["timestamp"], y=df["macd_hist"], name="MACD柱",
                           marker_color=colors, opacity=0.7))
@@ -834,11 +1207,17 @@ def MACD圖(df: pd.DataFrame) -> go.Figure:
         uirevision="macd-static",
         xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
     )
+    fig.update_yaxes(fixedrange=False)
+    if _x0 is not None and _x1 is not None and pd.notna(_x0) and pd.notna(_x1):
+        fig.update_xaxes(range=[_x0, _x1], autorange=False)
     return fig
 
 
 def ATR圖(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
+    _x = pd.to_datetime(df.get("timestamp"), utc=True, errors="coerce")
+    _x0 = _x.iloc[0] if len(_x) else None
+    _x1 = _x.iloc[-1] if len(_x) else None
     atr14 = pd.to_numeric(df.get("atr_14"), errors="coerce")
     atr_pct = pd.to_numeric(df.get("atr_pct"), errors="coerce") * 100.0
 
@@ -856,6 +1235,9 @@ def ATR圖(df: pd.DataFrame) -> go.Figure:
         yaxis_title="ATR / ATR%", uirevision="atr-static",
         xaxis=dict(gridcolor="#1e293b"), yaxis=dict(gridcolor="#1e293b"),
     )
+    fig.update_yaxes(fixedrange=False)
+    if _x0 is not None and _x1 is not None and pd.notna(_x0) and pd.notna(_x1):
+        fig.update_xaxes(range=[_x0, _x1], autorange=False)
     return fig
 
 
@@ -956,15 +1338,33 @@ def _build_past_event_table(signals_df: pd.DataFrame, max_rows: int = 40) -> pd.
 
 
 def _build_future_event_table(now_utc: pd.Timestamp, days: int = 120) -> pd.DataFrame:
+    def _event_ref_values(event_type: str) -> tuple[str, str]:
+        et = str(event_type or "").upper().strip()
+        if et == "CPI":
+            return "前值 3.4%", "預估 3.3%"
+        if et == "PPI":
+            return "前值 2.2%", "預估 2.1%"
+        if et == "FOMC":
+            return "前值 4.25%~4.50%", "預估 4.25%~4.50%"
+        return "前值 N/A", "預估 N/A"
+
     start = pd.to_datetime(now_utc, utc=True)
     end = start + pd.Timedelta(days=days)
     ev = generate_estimated_macro_events(start, end)
     if ev.empty:
-        return pd.DataFrame(columns=["時間(台北)", "事件", "類型", "風險權重"])
+        return pd.DataFrame(columns=["時間(台北)", "事件", "類型", "前值", "預估", "公布後", "風險權重"])
     out = pd.DataFrame()
-    out["時間(台北)"] = pd.to_datetime(ev["timestamp"], utc=True).dt.tz_convert("Asia/Taipei").dt.strftime("%Y-%m-%d %H:%M")
+    _ts = pd.to_datetime(ev["timestamp"], utc=True, errors="coerce")
+    out["時間(台北)"] = _ts.dt.tz_convert("Asia/Taipei").dt.strftime("%Y-%m-%d %H:%M")
     out["事件"] = ev["event_name"].astype(str)
     out["類型"] = ev["event_type"].astype(str)
+    _ref = out["類型"].apply(_event_ref_values)
+    out["前值"] = _ref.apply(lambda x: x[0])
+    out["預估"] = _ref.apply(lambda x: x[1])
+    out["公布後"] = [
+        "待匯入（已到公布時間）" if (pd.notna(ts) and ts <= start) else "待公布"
+        for ts in _ts
+    ]
     out["風險權重"] = pd.to_numeric(ev["risk_weight"], errors="coerce").fillna(0).round(2)
     return out.reset_index(drop=True)
 
@@ -1264,6 +1664,71 @@ def _collect_mtf_overlap(symbol: str, intervals: list[str]) -> dict[str, object]
     }
 
 
+def _fetch_live_open_candle(symbol: str, interval: str) -> dict[str, float] | None:
+    iv = str(interval).strip()
+    if iv not in INTERVAL_TO_SECONDS:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": iv, "limit": 2},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            return None
+        row = rows[-1]
+        # Binance kline format:
+        # [open_time, open, high, low, close, volume, close_time, ...]
+        ts = pd.to_datetime(int(row[0]), unit="ms", utc=True)
+        return {
+            "timestamp": ts,
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "open_time": int(row[0]),
+            "close_time": int(row[6]) if len(row) > 6 else int(row[0]),
+        }
+    except Exception:
+        return None
+
+
+def _apply_live_candle_patch(df: pd.DataFrame, live_row: dict[str, float] | None) -> pd.DataFrame:
+    if live_row is None or df.empty:
+        return df
+    out = df.copy()
+    if "timestamp" not in out.columns:
+        return out
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out = out[out["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
+    if out.empty:
+        return out
+    live_ts = pd.to_datetime(live_row["timestamp"], utc=True, errors="coerce")
+    if pd.isna(live_ts):
+        return out
+    same_mask = out["timestamp"] == live_ts
+    last_idx = int(out.index[-1])
+    patch_cols = ["open", "high", "low", "close", "volume", "open_time", "close_time"]
+    if same_mask.any():
+        idx = int(out[same_mask].index[-1])
+        for c in patch_cols:
+            if c in out.columns and c in live_row:
+                out.at[idx, c] = live_row[c]
+        return out
+    last_ts = pd.to_datetime(out.at[last_idx, "timestamp"], utc=True, errors="coerce")
+    if pd.notna(last_ts) and live_ts > last_ts:
+        new_row = {c: out.at[last_idx, c] if c in out.columns else None for c in out.columns}
+        new_row["timestamp"] = live_ts
+        for c in patch_cols:
+            if c in out.columns and c in live_row:
+                new_row[c] = live_row[c]
+        out = pd.concat([out, pd.DataFrame([new_row])], ignore_index=True)
+    return out
+
+
 def _render_kline_with_snr(
     display_df: pd.DataFrame,
     price_ref: float,
@@ -1274,6 +1739,7 @@ def _render_kline_with_snr(
     snr_overlap_min: int,
     snr_max_levels: int,
     plotly_cfg: dict,
+    chart_key: str = "kline_chart_main",
 ) -> None:
     if display_df.empty:
         st.info("目前沒有可顯示的 K 線資料。")
@@ -1332,7 +1798,7 @@ def _render_kline_with_snr(
                 y=float(lv.price),
                 xref="x",
                 yref="y",
-                text=f"{kind} x{overlap_count} {tfs}",
+                text=f"{kind} x{overlap_count} {tfs} | {float(lv.price):,.2f}",
                 showarrow=False,
                 xanchor="left",
                 xshift=6,
@@ -1340,7 +1806,7 @@ def _render_kline_with_snr(
                 bgcolor=label_bg,
             )
 
-    st.plotly_chart(fig_k, use_container_width=True, config=plotly_cfg)
+    st.plotly_chart(fig_k, use_container_width=True, config=plotly_cfg, key=chart_key)
 
 
 # ═══════════════════ SIDEBAR ═══════════════════════════════════════════════
@@ -1377,8 +1843,6 @@ if not bool(st.session_state.get("_ui_prefs_loaded_once", False)):
     st.session_state["ui_interval"] = str(_ui_prefs.get("kline_interval", "1h"))
     st.session_state["ui_kline_count"] = _pref_int("kline_count", 300, min_value=100, max_value=2000)
     st.session_state["ui_backtest_sample_rows"] = _pref_int("backtest_sample_rows", 0, min_value=0, max_value=2000000)
-    st.session_state["ui_kline_auto_update_enabled"] = bool(_ui_prefs.get("kline_auto_update_enabled", False))
-    st.session_state["ui_kline_auto_update_sec"] = _pref_int("kline_auto_update_sec", 15, min_value=5, max_value=3600)
     st.session_state["ui_max_train_rows"] = _pref_int("max_train_rows", 40000, min_value=0, max_value=2000000)
     st.session_state["ui_black_swan_reserve_usdt"] = _pref_float("black_swan_reserve_usdt", 0.0, min_value=0.0, max_value=10_000_000.0)
     st.session_state["ui_black_swan_threshold"] = _pref_float("black_swan_threshold", 1.0, min_value=0.0, max_value=10.0)
@@ -1433,18 +1897,9 @@ st.sidebar.caption("目前資料門檻：5m=200k、15m=80k、30m=70k、1h=40k、
 按鈕全量 = st.sidebar.button("全部週期抓資料+訓練", use_container_width=True)
 按鈕快速 = st.sidebar.button("全部週期快速更新", use_container_width=True)
 按鈕增量重訓 = st.sidebar.button("全部週期增量重訓", use_container_width=True)
-即時更新啟用 = st.sidebar.checkbox(
-    "K線即時更新",
-    key="ui_kline_auto_update_enabled",
-    help="開啟後會定時做『快速更新』並自動刷新頁面。",
-)
-即時更新秒數 = st.sidebar.number_input(
-    "K線即時更新秒數",
-    min_value=5,
-    max_value=3600,
-    step=1,
-    key="ui_kline_auto_update_sec",
-)
+# K-line live update is always on in background (option removed by request).
+即時更新啟用 = True
+即時更新秒數 = 5
 訓練最大樣本數 = st.sidebar.number_input(
     "重訓最大樣本數 (0=全量)",
     min_value=0,
@@ -1454,39 +1909,6 @@ st.sidebar.caption("目前資料門檻：5m=200k、15m=80k、30m=70k、1h=40k、
 )
 
 st.sidebar.divider()
-st.sidebar.markdown("### 🧑‍🏫 知識蒸餾 (Teacher)")
-st.sidebar.caption("用現有 CSV 訓練大型 Teacher 集成模型，產生高品質軟標籤。")
-_teacher_csv = 目前訊號檔  # 預設用目前週期的訊號檔
-_teacher_max_rows = st.sidebar.number_input(
-    "Teacher 最大訓練筆數 (0=全量)", min_value=0, max_value=500000, value=0, step=10000,
-    key="teacher_max_rows"
-)
-_teacher_temperature = st.sidebar.slider(
-    "軟標籤溫度 T（越大越平滑）", min_value=1.0, max_value=5.0, value=2.0, step=0.5,
-    key="teacher_temp"
-)
-_teacher_n_rf = st.sidebar.select_slider(
-    "RF 樹數", options=[100, 200, 300, 500, 800], value=500, key="teacher_n_rf"
-)
-按鈕訓練Teacher = st.sidebar.button(
-    "🧑‍🏫 訓練 Teacher 模型", use_container_width=True, key="btn_train_teacher"
-)
-_teacher_full_flow = st.sidebar.checkbox(
-    "Teacher 前先抓歷史+線上特徵，並自動重訓本地 Student",
-    value=True,
-    key="teacher_full_flow",
-    help="勾選後會執行：全量抓歷史資料(含線上事件特徵) → 訓練 Teacher → 以軟標籤重訓本地小模型。",
-)
-按鈕Teacher全流程 = st.sidebar.button(
-    "🌐 Teacher 全流程（抓歷史→蒸餾→本地AI）", use_container_width=True, key="btn_teacher_full_flow"
-)
-from src.distillation import teacher_exists, load_teacher_report
-_teacher_model_dir = BASE_DIR / "models"
-_teacher_ok = teacher_exists(_teacher_model_dir, 交易對, 週期)
-if _teacher_ok:
-    st.sidebar.success("✅ Teacher 模型已存在")
-else:
-    st.sidebar.info("尚未訓練 Teacher，點擊上方按鈕開始。")
 okx_inst = st.sidebar.text_input("OKX 合約 instId", value="BTC-USDT-SWAP")
 okx_notional = st.sidebar.number_input("下單本金(USDT)", min_value=5.0, max_value=100000.0,
                                          value=50.0, step=5.0)
@@ -1562,8 +1984,6 @@ _write_json_file(
         "kline_interval": str(st.session_state.get("ui_interval", "1h")),
         "kline_count": int(st.session_state.get("ui_kline_count", 300)),
         "backtest_sample_rows": int(st.session_state.get("ui_backtest_sample_rows", 0)),
-        "kline_auto_update_enabled": bool(st.session_state.get("ui_kline_auto_update_enabled", False)),
-        "kline_auto_update_sec": int(st.session_state.get("ui_kline_auto_update_sec", 15)),
         "max_train_rows": int(st.session_state.get("ui_max_train_rows", 40000)),
         "risk_profile": str(st.session_state.get("risk_profile", "中立 ⚖️")),
         "auto_trade_enabled": bool(st.session_state.get("ui_auto_trade_enabled", False)),
@@ -1677,27 +2097,6 @@ def _resolve_keep_rows_for_runtime(interval: str | None = None) -> int:
     )
 
 
-def _prepare_teacher_online_data_env(interval: str | None = None) -> None:
-    _target_interval = str(interval or 週期)
-    os.environ["TRAIN_DEVICE"] = "cloud"
-    os.environ["NPU_STRICT"] = "0"
-    # Force enough historical bars for each timeframe before teacher fitting.
-    os.environ["KLINE_KEEP_ROWS"] = str(int(週期資料門檻.get(_target_interval, 每週期K線顯示保底)))
-    # Let preprocessing/training use all available rows for teacher-source data generation.
-    os.environ["MAX_TRAIN_ROWS"] = "0"
-
-
-def _prepare_local_student_env(interval: str | None = None) -> int:
-    _target_interval = str(interval or 週期)
-    _user_limit = int(訓練最大樣本數)
-    _effective_train_rows = int(max(0, _user_limit))
-    os.environ["TRAIN_DEVICE"] = "cpu"
-    os.environ["NPU_STRICT"] = "0"
-    os.environ["MAX_TRAIN_ROWS"] = str(_effective_train_rows)
-    os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(_target_interval))
-    return _effective_train_rows
-
-
 if 按鈕全量:
     _train_cap = _prepare_data_train_env(週期)
     with st.spinner("正在更新全部週期資料並訓練（資料保留量會依訓練/回測樣本自動調整）..."):
@@ -1759,72 +2158,7 @@ if 按鈕增量重訓:
     else:
         st.success(f"增量更新 + 重訓回測完成（全部週期），每週期訓練筆數上限：{_train_cap}")
 
-# ── Teacher 蒸餾訓練 ──────────────────────────────────────────────────
-if 按鈕訓練Teacher or 按鈕Teacher全流程:
-    from src.distillation import train_teacher as _train_teacher
-    _run_teacher_full_flow = bool(按鈕Teacher全流程 or _teacher_full_flow)
-    _t_進度文字 = st.empty()
-    _t_進度條 = st.progress(0, text="Teacher 流程準備中...")
-
-    def _set_overall(p: int, msg: str) -> None:
-        _p = max(0, min(100, int(p)))
-        _t_進度條.progress(_p, text=f"{msg} ({_p}%)")
-        _t_進度文字.info(msg)
-
-    def _teacher_cb(p: int, msg: str) -> None:
-        # Teacher stage maps to 45~80
-        _p = max(0, min(100, int(45 + (int(p) * 35 / 100))))
-        _set_overall(_p, f"🧑‍🏫 Teacher：{msg}")
-
-    try:
-        if _run_teacher_full_flow:
-            _set_overall(5, "🌐 步驟 1/3：抓歷史資料並同步線上特徵...")
-            _prepare_teacher_online_data_env(週期)
-            run_pipeline(force_full_refresh=True, symbol=交易對, interval=週期)
-            _set_overall(40, "✅ 歷史資料與線上特徵同步完成")
-
-        if not _teacher_csv.exists():
-            raise FileNotFoundError(f"找不到訊號檔：{_teacher_csv.name}，請先執行資料更新。")
-
-        _set_overall(45, "🧑‍🏫 步驟 2/3：訓練 Teacher 並輸出軟標籤...")
-        _t_rpt = _train_teacher(
-            csv_path=_teacher_csv,
-            model_dir=BASE_DIR / "models",
-            output_dir=OUTPUT_DIR,
-            symbol=交易對,
-            interval=週期,
-            max_rows=int(_teacher_max_rows),
-            temperature=float(_teacher_temperature),
-            n_rf_estimators=int(_teacher_n_rf),
-            gb_n_estimators=200,
-            progress_cb=_teacher_cb,
-        )
-        st.session_state["teacher_report_cache"] = _t_rpt
-
-        if _run_teacher_full_flow:
-            _set_overall(82, "🧠 步驟 3/3：用 Teacher 軟標籤重訓本地小模型...")
-            _local_train_cap = _prepare_local_student_env(週期)
-            run_pipeline(force_full_refresh=False, symbol=交易對, interval=週期)
-            _set_overall(100, "✅ 全流程完成：Teacher + 本地 Student")
-            _stats = _t_rpt.get("soft_label_stats", {})
-            st.success(
-                f"✅ Teacher 全流程完成！平均信心：{_stats.get('mean_teacher_confidence', 0)*100:.1f}%"
-                f" | 平均槓桿：{_stats.get('mean_teacher_leverage', 0):.2f}×"
-                f" | 本地 Student 上限樣本數：{_local_train_cap}"
-            )
-        else:
-            _set_overall(100, "✅ Teacher 訓練完成")
-            _stats = _t_rpt.get("soft_label_stats", {})
-            st.success(
-                f"✅ Teacher 訓練完成！平均信心："
-                f"{_stats.get('mean_teacher_confidence', 0)*100:.1f}%  |  "
-                f"平均槓桿：{_stats.get('mean_teacher_leverage', 0):.2f}×  |  "
-                f"槓桿 MAE：{_t_rpt.get('leverage_mae', 0):.4f}"
-            )
-    except Exception as _e:
-        st.error(f"Teacher 流程失敗：{_e}")
-
-if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全量 or 按鈕快速 or 按鈕增量重訓 or 按鈕訓練Teacher or 按鈕Teacher全流程):
+if st.session_state.get("_sync_after_interval_switch", False) and not (按鈕全量 or 按鈕快速 or 按鈕增量重訓):
     with st.sidebar:
         with st.spinner("已切換週期，正在同步..."):
             try:
@@ -2098,6 +2432,41 @@ if 自動交易啟用 and not _use_auto_trade_fragment:
 
 # ═══════════════════ MAIN UI ════════════════════════════════════════════════
 
+# ── 頂部控制列 ────────────────────────────────────────────────────────────────
+st.markdown("## 🎛️ 頂部控制列")
+頂部控制列 = st.columns([1.35, 1.15, 1.0])
+with 頂部控制列[0]:
+    st.markdown("""<div class="metric-card"><div class="metric-title">黑天鵝緩衝金 (USDT)</div></div>""", unsafe_allow_html=True)
+    st.number_input(
+        "黑天鵝緩衝金 (USDT)",
+        min_value=0.0,
+        max_value=10_000_000.0,
+        step=10.0,
+        key="ui_black_swan_reserve_usdt",
+        label_visibility="collapsed",
+        help="黑天鵝事件觸發時，純AI自動交易會暫停；此金額視為你保留手動操作的資金。",
+    )
+with 頂部控制列[1]:
+    st.markdown("""<div class="metric-card"><div class="metric-title">黑天鵝觸發門檻（風險分數）</div></div>""", unsafe_allow_html=True)
+    st.number_input(
+        "黑天鵝觸發門檻（風險分數）",
+        min_value=0.0,
+        max_value=10.0,
+        step=0.1,
+        key="ui_black_swan_threshold",
+        label_visibility="collapsed",
+        help="無單位分數（0~10）。當 black_swan_risk_score 超過此值時，自動交易暫停並改為手動操作。",
+    )
+with 頂部控制列[2]:
+    st.markdown(
+        f"""<div class="metric-card">
+              <div class="metric-title">目前週期 / K線顯示</div>
+              <div class="metric-value" style="font-size:1.35rem;">{週期} / {int(K線根數):,}</div>
+              <div class="subtle">自動刷新：{int(即時更新秒數)} 秒</div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
+
 # ── AI 風格卡片 ──────────────────────────────────────────────────────────────
 style_class_map = {"激進 🔥": "style-aggressive", "中立 ⚖️": "style-neutral", "保守 🛡️": "style-conservative"}
 style_cn_map = {"激進 🔥": "激進", "中立 ⚖️": "中立", "保守 🛡️": "保守"}
@@ -2213,29 +2582,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-控制列 = st.columns([1.35, 1.15])
-with 控制列[0]:
-    st.markdown("""<div class="metric-card"><div class="metric-title">黑天鵝緩衝金 (USDT)</div></div>""", unsafe_allow_html=True)
-    st.number_input(
-        "黑天鵝緩衝金 (USDT)",
-        min_value=0.0,
-        max_value=10_000_000.0,
-        step=10.0,
-        key="ui_black_swan_reserve_usdt",
-        label_visibility="collapsed",
-        help="黑天鵝事件觸發時，純AI自動交易會暫停；此金額視為你保留手動操作的資金。",
-    )
-with 控制列[1]:
-    st.markdown("""<div class="metric-card"><div class="metric-title">黑天鵝觸發門檻（風險分數）</div></div>""", unsafe_allow_html=True)
-    st.number_input(
-        "黑天鵝觸發門檻（風險分數）",
-        min_value=0.0,
-        max_value=10.0,
-        step=0.1,
-        key="ui_black_swan_threshold",
-        label_visibility="collapsed",
-        help="無單位分數（0~10）。當 black_swan_risk_score 超過此值時，自動交易暫停並改為手動操作。",
-    )
+_trade_allowed_now = int(pd.to_numeric(最新.get("trade_allowed", 1), errors="coerce") or 0) == 1
+if not _trade_allowed_now:
+    _trade_state_text = "風控阻擋"
+    _trade_state_cls = "state-stop"
+elif 訊號 == "觀望":
+    _trade_state_text = "觀望中"
+    _trade_state_cls = "state-warn"
+else:
+    _trade_state_text = "可交易"
+    _trade_state_cls = "state-ok"
+_model_state_cls = "state-stop" if 觸發警報 else "state-ok"
+_model_state_text = "模型警戒中" if 觸發警報 else "模型穩定"
+st.markdown(
+    f'<div style="margin:4px 0 10px;">'
+    f'<span class="state-pill {_trade_state_cls}">交易狀態：{_trade_state_text}</span>'
+    f'<span class="state-pill {_model_state_cls}">模型狀態：{_model_state_text}</span>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
 
 st.markdown(
     f'<div class="signal-line" style="margin:12px 0 4px">訊號: <span class="{顏色類}">{訊號}</span>'
@@ -2280,6 +2645,7 @@ st.markdown(
 
 顯示區 = signals.tail(int(K線根數)).copy()
 回測樣本區 = signals.copy()
+_inject_middle_drag_xzoom()
 if int(回測樣本數) > 0 and len(回測樣本區) > int(回測樣本數):
     回測樣本區 = 回測樣本區.tail(int(回測樣本數)).reset_index(drop=True)
 目前回測曲線, 目前回測報告 = run_backtest(回測樣本區.copy(), 目前設定, interval=週期) if not 回測樣本區.empty else (pd.DataFrame(), {})
@@ -2293,16 +2659,23 @@ if not 回測樣本區.empty:
 
 # ── K線圖 ─────────────────────────────────────────────────────────────────────
 _plotly_interact_config = {
-    "scrollZoom": True,
+    "scrollZoom": False,
     "displayModeBar": True,
     "modeBarButtonsToAdd": ["pan2d", "zoom2d", "resetScale2d"],
+}
+_plotly_prob_fixed_config = {
+    "scrollZoom": False,
+    "displayModeBar": False,
+    "staticPlot": True,
 }
 if _use_fragment_live_update and _fragment_api is not None:
     @(_fragment_api(run_every=float(max(5, int(即時更新秒數)))))
     def _live_kline_fragment() -> None:
         上次更新 = float(st.session_state.get("kline_auto_last_update_ts", 0.0))
         現在 = time.time()
-        if (現在 - 上次更新) >= int(即時更新秒數):
+        # Keep model/data sync on a slower cadence to avoid flicker and heavy recompute.
+        _sync_sec = int(max(30, int(即時更新秒數) * 6))
+        if (現在 - 上次更新) >= _sync_sec:
             try:
                 os.environ["KLINE_KEEP_ROWS"] = str(_resolve_keep_rows_for_runtime(週期))
                 run_quick_update(symbol=交易對, interval=週期)
@@ -2330,6 +2703,8 @@ if _use_fragment_live_update and _fragment_api is not None:
             if _live_signals.empty:
                 _live_signals = _build_fallback_signals_from_raw(交易對, 週期, keep_rows=max(1000, int(K線根數)))
         _live_show = _live_signals.tail(int(K線根數)).copy() if not _live_signals.empty else 顯示區
+        _live_candle = _fetch_live_open_candle(交易對, 週期)
+        _live_show = _apply_live_candle_patch(_live_show, _live_candle)
         _live_price = float(pd.to_numeric(_live_show["close"], errors="coerce").iloc[-1]) if not _live_show.empty else 價格
         _render_kline_with_snr(
             _live_show,
@@ -2341,6 +2716,7 @@ if _use_fragment_live_update and _fragment_api is not None:
             snr_overlap_min=int(SNR重疊層數),
             snr_max_levels=int(SNR最大線數),
             plotly_cfg=_plotly_interact_config,
+            chart_key=f"kline_chart_{交易對}_{週期}",
         )
         if st.session_state.get("kline_auto_last_msg"):
             st.caption(str(st.session_state["kline_auto_last_msg"]))
@@ -2356,6 +2732,7 @@ else:
         snr_overlap_min=int(SNR重疊層數),
         snr_max_levels=int(SNR最大線數),
         plotly_cfg=_plotly_interact_config,
+        chart_key=f"kline_chart_{交易對}_{週期}",
     )
 
 if _use_auto_trade_fragment and _fragment_api is not None:
@@ -2420,70 +2797,52 @@ if _use_auto_trade_fragment and _fragment_api is not None:
 
     _live_auto_trade_fragment()
 
-# ── 分頁 ─────────────────────────────────────────────────────────────────────
-分頁 = st.tabs([
-    "📊 買賣機率",
-    "📈 趨勢高低點",
-    "〽️ MACD",
-    "📉 ATR",
-    "🗞️ 事件",
-    "😨 恐懼貪婪",
-    "📋 交易紀錄",
-    "🏆 回測摘要",
-    "🧑‍🏫 Teacher蒸餾",
-], key="main_dashboard_tabs")
+# ── 單頁儀表板（重構） ──────────────────────────────────────────────────────────
+st.markdown("## 📊 圖表總覽")
 
-with 分頁[0]:
-    st.plotly_chart(買賣橫條圖(P看漲, P看跌, P觀望), use_container_width=True, config=_plotly_interact_config)
+st.markdown("### 〽️ MACD")
+st.plotly_chart(MACD圖(顯示區), use_container_width=True, config=_plotly_interact_config)
+st.markdown("### 📉 ATR")
+st.plotly_chart(ATR圖(顯示區), use_container_width=True, config=_plotly_interact_config)
+st.markdown("### 📈 24h 趨勢高低點")
+st.plotly_chart(趨勢高低點圖(顯示區), use_container_width=True, config=_plotly_interact_config)
+st.markdown("### 📊 買賣機率")
+st.plotly_chart(買賣橫條圖(P看漲, P看跌, P觀望), use_container_width=True, config=_plotly_prob_fixed_config)
+st.markdown("### 😨 恐懼貪婪")
+st.plotly_chart(恐懼貪婪儀表(取得數值(最新, "fear_greed_value", 50.0)), use_container_width=True, config=_plotly_interact_config)
+st.plotly_chart(恐懼貪婪歷史圖(signals), use_container_width=True, config=_plotly_interact_config)
 
-with 分頁[1]:
-    st.plotly_chart(趨勢高低點圖(顯示區), use_container_width=True, config=_plotly_interact_config)
+st.markdown("## 🗞️ 事件")
+目前風險分數 = 取得數值(最新, "market_panic_score", 0.0)
+st.caption(
+    f"目前事件風險分數：`{目前風險分數:.2f}`（由戰爭/恐慌新聞、黑天鵝訊號、CPI/PPI/FOMC 時段等特徵組合）"
+)
+st.caption("新聞源每小時更新，會特別追蹤『美聯儲 / 川普 / 戰爭 / 恐慌』關鍵字。")
+if 取得數值(最新, "war_news_score", 0.0) > 0:
+    st.error("偵測到戰爭/地緣衝突新聞，請優先檢查倉位風險。")
+elif 取得數值(最新, "panic_news_score", 0.0) > 0:
+    st.warning("偵測到市場恐慌訊號，策略會偏向防守或反向避險。")
 
-with 分頁[2]:
-    st.plotly_chart(MACD圖(顯示區), use_container_width=True, config=_plotly_interact_config)
+事件左, 事件右 = st.columns(2)
+with 事件左:
+    st.markdown("#### 過去事件")
+    過去事件表 = _build_past_event_table(signals, max_rows=80)
+    if 過去事件表.empty:
+        st.info("最近沒有顯著事件。")
+    else:
+        st.dataframe(過去事件表, use_container_width=True, hide_index=True)
+with 事件右:
+    st.markdown("#### 未來事件")
+    未來事件表 = _build_future_event_table(pd.Timestamp.utcnow(), days=120)
+    if 未來事件表.empty:
+        st.info("目前沒有未來事件資料。")
+    else:
+        st.dataframe(未來事件表, use_container_width=True, hide_index=True)
 
-with 分頁[3]:
-    st.plotly_chart(ATR圖(顯示區), use_container_width=True, config=_plotly_interact_config)
-
-with 分頁[4]:
-    st.markdown("### 🗞️ 事件清單（左：過去 / 右：未來）")
-    目前風險分數 = 取得數值(最新, "market_panic_score", 0.0)
-    st.caption(
-        f"目前事件風險分數：`{目前風險分數:.2f}`（由戰爭/恐慌新聞、黑天鵝訊號、CPI/PPI/FOMC 時段等特徵組合）"
-    )
-    st.caption("新聞源每小時更新，會特別追蹤『美聯儲 / 川普 / 戰爭 / 恐慌』關鍵字。")
-    if 取得數值(最新, "war_news_score", 0.0) > 0:
-        st.error("偵測到戰爭/地緣衝突新聞，請優先檢查倉位風險。")
-    elif 取得數值(最新, "panic_news_score", 0.0) > 0:
-        st.warning("偵測到市場恐慌訊號，策略會偏向防守或反向避險。")
-
-    左欄, 右欄 = st.columns(2)
-    with 左欄:
-        st.markdown("#### 過去事件")
-        過去事件表 = _build_past_event_table(signals, max_rows=50)
-        if 過去事件表.empty:
-            st.info("最近沒有顯著事件。")
-        else:
-            st.dataframe(過去事件表, use_container_width=True, hide_index=True)
-    with 右欄:
-        st.markdown("#### 未來事件")
-        未來事件表 = _build_future_event_table(pd.Timestamp.utcnow(), days=120)
-        if 未來事件表.empty:
-            st.info("目前沒有未來事件資料。")
-        else:
-            st.dataframe(未來事件表, use_container_width=True, hide_index=True)
-
-with 分頁[5]:
-    st.plotly_chart(恐懼貪婪儀表(取得數值(最新, "fear_greed_value", 50.0)), use_container_width=True, config=_plotly_interact_config)
-
-# ─── 交易紀錄分頁（新） ────────────────────────────────────────────────────────
-with 分頁[6]:
-    st.markdown("### 📋 AI 交易紀錄")
-
+with st.expander("📋 交易紀錄", expanded=True):
     if trades_df.empty:
         st.info("尚未產生交易明細。請先執行一次「增量更新+重訓回測」或「快速更新」。")
     else:
-        # 累計盈虧折線圖（僅顯示台北時區「今日 00:00」之後）
         _chart_df = trades_df.copy()
         _x_col = "出場時間" if "出場時間" in _chart_df.columns else _chart_df.columns[0]
         _x_ts = pd.to_datetime(_chart_df[_x_col], utc=True, errors="coerce")
@@ -2493,57 +2852,24 @@ with 分頁[6]:
         if _chart_df.empty:
             st.info(f"今日（{_today_tw.strftime('%Y-%m-%d')}）尚無可顯示的交易圖表資料。")
         else:
-            st.plotly_chart(
-                盈虧折線圖(_chart_df),
-                use_container_width=True,
-                config=_plotly_interact_config,
-            )
+            st.plotly_chart(盈虧折線圖(_chart_df), use_container_width=True, config=_plotly_interact_config)
 
         st.divider()
         st.markdown("#### 逐筆交易明細")
-
-        # 格式化表格
         display_df = 格式化交易明細(trades_df, signals)
-
         if display_df.empty:
             _raw = trades_df.copy()
             for _c in _raw.select_dtypes(include="object").columns:
                 _raw[_c] = _raw[_c].astype(str)
             st.dataframe(_safe_df(_raw), use_container_width=True, hide_index=True)
         else:
-            # 排序控制
             c1, c2 = st.columns([3, 2])
             with c1:
-                sort_col = st.selectbox("排序欄位", options=list(display_df.columns), index=0,
-                                         key="trade_sort_col_new")
+                sort_col = st.selectbox("排序欄位", options=list(display_df.columns), index=0, key="trade_sort_col_new")
             with c2:
                 sort_desc = st.checkbox("降冪排序", value=True, key="trade_sort_desc_new")
 
-            sorted_df = display_df.sort_values(
-                by=sort_col, ascending=not sort_desc, na_position="last"
-            ).reset_index(drop=True)
-
-            # 顏色標記：方向欄位
-            def _style_row(row: pd.Series):
-                styles = [""] * len(row)
-                if "方向" in display_df.columns:
-                    idx = list(display_df.columns).index("方向")
-                    if idx < len(styles):
-                        if str(row.iloc[idx]) == "多":
-                            styles[idx] = "color:#22c55e;font-weight:700"
-                        elif str(row.iloc[idx]) == "空":
-                            styles[idx] = "color:#ef4444;font-weight:700"
-                if "盈虧(USDT)" in display_df.columns:
-                    idx2 = list(display_df.columns).index("盈虧(USDT)")
-                    if idx2 < len(styles):
-                        try:
-                            val = float(str(row.iloc[idx2]).replace("%", ""))
-                            styles[idx2] = "color:#22c55e" if val >= 0 else "color:#ef4444"
-                        except Exception:
-                            pass
-                return styles
-
-            # 確保所有字串欄位是純 str，數値欄位是純 float，避免 Arrow 序列化錯誤
+            sorted_df = display_df.sort_values(by=sort_col, ascending=not sort_desc, na_position="last").reset_index(drop=True)
             _display_df = sorted_df.copy()
             for _c in _display_df.columns:
                 if _c in ["盈虧%", "看漲機率", "看跌機率", "信心指數", "AI風格", "方向", "進場時間", "出場時間"]:
@@ -2565,7 +2891,6 @@ with 分頁[6]:
                 } if hasattr(st, "column_config") else None,
             )
 
-            # 統計摘要
             st.divider()
             st.markdown("#### 📊 快速統計")
             stat_cols = st.columns(4)
@@ -2584,14 +2909,13 @@ with 分頁[6]:
                 if "盈虧(USDT)" in sorted_df.columns:
                     try:
                         total_pnl = sorted_df["盈虧(USDT)"].astype(float).sum()
-                        st.metric("總盈虧(USDT)", f"{total_pnl:+.3f}",
-                                   delta_color="normal" if total_pnl >= 0 else "inverse")
+                        st.metric("總盈虧(USDT)", f"{total_pnl:+.3f}", delta_color="normal" if total_pnl >= 0 else "inverse")
                     except Exception:
                         st.metric("總盈虧(USDT)", "N/A")
                 else:
                     st.metric("總盈虧(USDT)", "N/A")
 
-with 分頁[7]:
+with st.expander("🏆 回測摘要", expanded=True):
     bt = 目前回測報告 if isinstance(目前回測報告, dict) else {}
     _wf_report = _read_json_file(OUTPUT_DIR / f"walkforward_report_{tag}.json")
     _wf_is_stale = _is_walkforward_stale(_wf_report, len(回測樣本區), str(回測樣本區["timestamp"].iloc[-1]) if not 回測樣本區.empty else "")
@@ -2623,13 +2947,14 @@ with 分頁[7]:
         for _col, (_title, _value, _hint) in zip(_split_cols, _split_cards):
             with _col:
                 st.markdown(
-                    f"""<div class="metric-card">
-                          <div class="metric-title">{_title}</div>
-                          <div class="metric-value">{_value}</div>
-                          <div class="subtle">{_hint}</div>
+                    f"""<div class=\"metric-card\">
+                          <div class=\"metric-title\">{_title}</div>
+                          <div class=\"metric-value\">{_value}</div>
+                          <div class=\"subtle\">{_hint}</div>
                         </div>""",
                     unsafe_allow_html=True,
                 )
+
         trade_items = [
             ("回測K線數", 回測顯示值("回測K線數", bt.get("rows"))),
             ("交易筆數", 回測顯示值("交易筆數", bt.get("trades"))),
@@ -2651,12 +2976,10 @@ with 分頁[7]:
         c_top1, c_top2 = st.columns(2)
         with c_top1:
             st.markdown("#### 交易級指標")
-            trade_df = pd.DataFrame(trade_items, columns=["指標", "數值"])
-            st.dataframe(_safe_df(trade_df), use_container_width=True, hide_index=True)
+            st.dataframe(_safe_df(pd.DataFrame(trade_items, columns=["指標", "數值"])), use_container_width=True, hide_index=True)
         with c_top2:
             st.markdown("#### 權益曲線指標")
-            curve_df = pd.DataFrame(curve_items, columns=["指標", "數值"])
-            st.dataframe(_safe_df(curve_df), use_container_width=True, hide_index=True)
+            st.dataframe(_safe_df(pd.DataFrame(curve_items, columns=["指標", "數值"])), use_container_width=True, hide_index=True)
 
         stress_tests = bt.get("cost_stress_tests", {}) if isinstance(bt.get("cost_stress_tests"), dict) else {}
         if stress_tests:
@@ -2736,75 +3059,6 @@ with 分頁[7]:
             else:
                 st.info("尚未產生 walk-forward 報告。點左側按鈕即可開始。")
 
-# ── Teacher 蒸餾分頁 (index 8) ───────────────────────────────────────────────
-import plotly.graph_objects as _pgo
-
-with 分頁[8]:
-    st.markdown("### 🧑‍🏫 Teacher 模型蒸餾報告")
-    from src.distillation import (
-        teacher_exists as _tch_exists,
-        load_teacher_report as _load_tch_rpt,
-        load_teacher_soft_labels as _load_soft,
-    )
-
-    if not _tch_exists(BASE_DIR / "models", 交易對, 週期):
-        st.info("尚未訓練 Teacher 模型。請在左側「🧑‍🏫 知識蒸餾 (Teacher)」區域點擊「訓練 Teacher 模型」。")
-        st.markdown("""
-| 角色 | 說明 |
-|------|------|
-| **Teacher** | RF×500 + GradientBoosting 大型集成，訓練慢但品質高 |
-| **軟標籤** | Teacher 輸出的機率分佈（溫度縮放），比 0/1 更豐富 |
-| **Student** | 現有小模型，未來學習 Teacher 軟標籤提升準確率 |
-| **溫度 T** | T=2 → 機率更平滑，讓 Student 更容易學習不確定性 |
-        """)
-    else:
-        _rpt = st.session_state.get("teacher_report_cache") or _load_tch_rpt(OUTPUT_DIR, 交易對, 週期)
-        if _rpt:
-            _m = _rpt.get("meta", {})
-            _stats = _rpt.get("soft_label_stats", {})
-            _cls_rpt = _rpt.get("classification_report", {})
-            _tc1, _tc2, _tc3, _tc4 = st.columns(4)
-            _tc1.metric("📊 訓練筆數", f"{_m.get('n_rows', 0):,}")
-            _tc2.metric("🌡️ 溫度 T", f"{_m.get('temperature', 2.0):.1f}")
-            _tc3.metric("🧠 平均信心", f"{_stats.get('mean_teacher_confidence', 0)*100:.1f}%")
-            _tc4.metric("💰 平均槓桿", f"{_stats.get('mean_teacher_leverage', 0):.2f}×")
-            _tc5, _tc6, _tc7, _tc8 = st.columns(4)
-            _tc5.metric("RF 樹數", f"{_m.get('n_rf_estimators', 0)} 棵")
-            _tc6.metric("GB 迭代數", f"{_m.get('gb_n_estimators', 0)}")
-            _tc7.metric("槓桿 MAE", f"{_rpt.get('leverage_mae', 0):.4f}")
-            _wf1 = _cls_rpt.get("weighted avg", {}).get("f1-score", 0)
-            _tc8.metric("F1 (weighted)", f"{_wf1:.4f}")
-            st.divider()
-            _sl = _load_soft(OUTPUT_DIR, 交易對, 週期)
-            if not _sl.empty:
-                _x = (pd.to_datetime(_sl["timestamp"], utc=True, errors="coerce") if "timestamp" in _sl.columns else list(range(len(_sl))))
-                _fig_t = _pgo.Figure()
-                for _col, _color, _name in [("soft_p_long", "#22c55e", "🟢 看漲"), ("soft_p_short", "#ef4444", "🔴 看跌"), ("soft_p_flat", "#64748b", "⚪ 觀望")]:
-                    if _col in _sl.columns:
-                        _fig_t.add_trace(_pgo.Scatter(x=_x, y=_sl[_col], name=_name, line=dict(color=_color, width=1.2), mode="lines"))
-                _fig_t.update_layout(template="plotly_dark", height=300, margin=dict(l=20,r=20,t=36,b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", dragmode="pan", title=dict(text=f"Teacher 軟標籤機率（T={_m.get('temperature',2.0)}）", font=dict(size=13,color="#94a3b8")), legend=dict(orientation="h",y=-0.2))
-                st.plotly_chart(_fig_t, use_container_width=True, config=_plotly_interact_config)
-                _fig_t2 = _pgo.Figure()
-                if "teacher_confidence" in _sl.columns:
-                    _fig_t2.add_trace(_pgo.Scatter(x=_x, y=(_sl["teacher_confidence"]*100).round(2), name="Teacher 信心%", line=dict(color="#a78bfa",width=1.5), mode="lines"))
-                if "teacher_leverage" in _sl.columns:
-                    _fig_t2.add_trace(_pgo.Scatter(x=_x, y=_sl["teacher_leverage"].round(2), name="Teacher 槓桿", line=dict(color="#f59e0b",width=1.5), mode="lines", yaxis="y2"))
-                _fig_t2.update_layout(template="plotly_dark", height=260, margin=dict(l=20,r=20,t=30,b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", dragmode="pan", yaxis=dict(title="信心 %",side="left"), yaxis2=dict(title="槓桿",overlaying="y",side="right"), legend=dict(orientation="h",y=-0.25))
-                st.plotly_chart(_fig_t2, use_container_width=True, config=_plotly_interact_config)
-                st.markdown("**軟標籤樣本（最新 50 筆）**")
-                _sl_show = _sl.tail(50).copy()
-                for _nc in ["soft_p_long","soft_p_short","soft_p_flat","raw_p_long","raw_p_short","teacher_confidence","teacher_leverage"]:
-                    if _nc in _sl_show.columns:
-                        _sl_show[_nc] = pd.to_numeric(_sl_show[_nc], errors="coerce").round(4)
-                if "teacher_signal" in _sl_show.columns:
-                    _sl_show["teacher_signal"] = _sl_show["teacher_signal"].astype(str)
-                st.dataframe(_safe_df(_sl_show), use_container_width=True, hide_index=True)
-                st.caption(f"📂 軟標籤：outputs/teacher_soft_labels_{交易對}_{週期}.csv | 模型：models/teacher/{交易對}_{週期}/")
-            else:
-                st.info("軟標籤 CSV 尚未產生，請先點擊「訓練 Teacher」。")
-        else:
-            st.warning("找不到 Teacher 報告檔案。")
-
 # ── 自動刷新狀態（純 fragment，避免整頁跳轉） ────────────────────────────────
 if 即時更新啟用 and _use_fragment_live_update:
     st.sidebar.caption(f"⏱ K線即時更新中，每 {int(即時更新秒數)} 秒局部刷新圖表。")
@@ -2815,3 +3069,4 @@ if 自動交易啟用 and _use_auto_trade_fragment:
     st.sidebar.caption(f"🤖 純AI自動交易中，每 {int(自動交易秒數)} 秒檢查一次。")
 elif 自動交易啟用:
     st.sidebar.caption("⚠️ 目前環境不支援 fragment 自動交易輪詢，請手動觸發或開啟可用版本。")
+

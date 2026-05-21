@@ -150,3 +150,7 @@ powershell -ExecutionPolicy Bypass -File build_tools\build_exe.ps1
 - 交易紀錄累計圖改為僅顯示「台北時區今日 00:00 之後」資料。
 - 信心指數改為方向信心（取 `max(看漲, 看跌)`），避免觀望偏高時長期顯示 0。
 - CSV 讀取加入容錯，壞行會自動略過，避免整個 dashboard 因單行格式錯誤中斷。
+
+## 專案狀態
+- AI 蒸餾：處理中（進行中）
+
